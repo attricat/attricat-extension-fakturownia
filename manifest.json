@@ -1,0 +1,183 @@
+{
+  "manifest_version": 1,
+  "name": "Fakturownia",
+  "version": "0.1.0",
+  "description": "Two-way sync of clients between Attricat and Fakturownia (spike).",
+  "icons": {
+    "48": "assets/icon-48.svg"
+  },
+  "attricat": {
+    "id": "attricat-fakturownia",
+    "host_api": ">=1.2.0, <2.0.0"
+  },
+  "permissions": [
+    "attricat.read",
+    "attricat.write",
+    "events.subscribe",
+    "exports.mappings",
+    "secrets.read",
+    "network.request",
+    "storage.extension",
+    "configuration.read",
+    "logging.write",
+    "webhooks.receive"
+  ],
+  "host_permissions": [
+    {
+      "id": "fakturownia-api",
+      "matches": [
+        "https://*.fakturownia.pl/*"
+      ],
+      "methods": [
+        "GET",
+        "POST",
+        "PUT"
+      ],
+      "allow_query": true,
+      "timeout_ms": 10000,
+      "rate_limit": {
+        "requests": 60,
+        "per_seconds": 60,
+        "burst": 20
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "id": "server",
+      "kind": "server_wasm",
+      "path": "dist/server.wasm"
+    }
+  ],
+  "configuration": {
+    "version": 1,
+    "schema": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "account",
+        "clients"
+      ],
+      "properties": {
+        "account": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]{1,63}$",
+          "description": "The Fakturownia account subdomain: <account>.fakturownia.pl."
+        },
+        "token_secret": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "description": "Name of the extension secret holding the Fakturownia API token (default fakturownia-api-token)."
+        },
+        "verify_webhook_token": {
+          "type": "boolean",
+          "description": "Refuse webhooks whose api_token field does not match the API token (default true)."
+        },
+        "clients": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "blueprint_id",
+            "blueprint_version",
+            "context_id",
+            "fields"
+          ],
+          "properties": {
+            "blueprint_id": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36
+            },
+            "blueprint_version": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "context_id": {
+              "type": "string",
+              "minLength": 36,
+              "maxLength": 36
+            },
+            "fields": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 8,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "field",
+                  "attribute"
+                ],
+                "properties": {
+                  "field": {
+                    "enum": [
+                      "name",
+                      "tax_no",
+                      "email",
+                      "phone",
+                      "street",
+                      "city",
+                      "post_code",
+                      "country"
+                    ]
+                  },
+                  "attribute": {
+                    "type": "string",
+                    "pattern": "^[a-z][a-z0-9_]*$",
+                    "maxLength": 64
+                  },
+                  "owner": {
+                    "enum": [
+                      "attricat",
+                      "fakturownia",
+                      "both"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "server": {
+    "event_handlers": [
+      {
+        "id": "push-clients",
+        "event_types": [
+          "record.created.v1",
+          "record.updated.v1"
+        ],
+        "handler": "handle-event",
+        "debounce_ms": 2000
+      },
+      {
+        "id": "apply-webhooks",
+        "event_types": [
+          "webhook.received.v1"
+        ],
+        "handler": "handle-event"
+      }
+    ],
+    "webhooks": [
+      {
+        "id": "fakturownia",
+        "title": "Fakturownia changes",
+        "max_body_bytes": 262144
+      }
+    ],
+    "operations": [
+      {
+        "id": "pull",
+        "handler": "pull",
+        "request_schema": {
+          "type": "object",
+          "additionalProperties": false
+        },
+        "max_checkpoint_bytes": 4096
+      }
+    ]
+  }
+}
