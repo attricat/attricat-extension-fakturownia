@@ -10,7 +10,7 @@ use attricat_fakturownia_sync_core::{
 };
 
 use crate::attricat::host::outcomes::{Failure, Rejection, Retry};
-use crate::host::{self, Begin, Http};
+use crate::host::{self, Begin, Http, Mode};
 
 const STATUS_OK: u16 = 200;
 const STATUS_CREATED: u16 = 201;
@@ -72,13 +72,40 @@ fn client_id(body: &str) -> Option<String> {
         .or_else(|| id.as_str().map(str::to_owned))
 }
 
+/// The configured context's ID.
+pub fn context_id(config: &Config, mode: &Mode) -> Result<String, Failure> {
+    let code = &config.clients.context;
+    host::context(mode, code)?.ok_or_else(|| {
+        rejected(
+            "configuration_invalid",
+            format!("no context has the code {code}"),
+            None,
+        )
+    })
+}
+
+/// The configured blueprint's current revision, which new records use.
+pub fn blueprint(config: &Config, mode: &Mode) -> Result<host::Blueprint, Failure> {
+    let code = &config.clients.blueprint;
+    host::blueprint(mode, code)?.ok_or_else(|| {
+        rejected(
+            "configuration_invalid",
+            format!("no published blueprint has the code {code}"),
+            None,
+        )
+    })
+}
+
 /// Pushes a changed client record to Fakturownia.
 pub fn push_record(config: &Config, record_id: &str, revision: Option<i64>) -> Result<(), Failure> {
-    let record = host::read_record(record_id)?;
-    if record.blueprint_id != config.clients.blueprint_id || record.deleted {
+    let mode = Mode::Handler;
+    // Every record event arrives here; one read tells whether it is a client.
+    let record = host::read_record(&mode, record_id, None)?;
+    if record.blueprint != config.clients.blueprint || record.deleted {
         return Ok(());
     }
-    let values = host::resolved_values(record_id, &config.clients.context_id)?;
+    let context_id = context_id(config, &mode)?;
+    let values = host::read_record(&mode, record_id, Some(&context_id))?.values;
     let projection = local_projection(&config.clients, &values);
     let hash = projection_hash(&projection);
     let revision = revision.or(record.content_revision).unwrap_or_default();
@@ -218,26 +245,9 @@ fn intent_key(action: &str, id: &str, updated_at: &str) -> String {
     key
 }
 
-/// Where an inbound change is applied from.
-pub enum Mode<'a> {
-    /// An event handler: reads the record and writes only what changed.
-    Handler,
-    /// An operation run, which has no single-record read: it writes every
-    /// field Fakturownia may change, under the run's batch key.
-    Run { batch_key: &'a str },
-}
-
-impl Mode<'_> {
-    fn command(&self, intent: Value) -> Result<Result<String, String>, String> {
-        match self {
-            Mode::Handler => host::command(intent, None),
-            Mode::Run { batch_key } => host::command(intent, Some(batch_key)),
-        }
-    }
-}
-
 /// Applies a fetched Fakturownia client to its record, creating the record
-/// when the client is new to Attricat.
+/// when the client is new to Attricat. Only the fields that differ are
+/// written, and the merged projection becomes the agreed state.
 pub fn apply_client(
     config: &Config,
     client: &Map<String, Value>,
@@ -258,26 +268,24 @@ pub fn apply_client(
             _ => None,
         },
     };
+    let context_id = context_id(config, mode)?;
     let Some(mapping) = mapping else {
+        let blueprint = blueprint(config, mode)?;
         let remote = local_projection(sync, &remote_values(sync, client));
         let values: Vec<Value> = sync
             .fields
             .iter()
             .filter_map(|mapping| {
                 let value = remote.get(&mapping.field)?;
-                Some(host::scalar(
-                    &mapping.attribute,
-                    &sync.context_id,
-                    Some(value),
-                ))
+                Some(host::scalar(&mapping.attribute, &context_id, value))
             })
             .collect();
         let record_id = mode
             .command(json!({
                 "kind": "create",
                 "intent_key": intent_key("create", &id, updated_at),
-                "blueprint_id": sync.blueprint_id,
-                "blueprint_version": sync.blueprint_version,
+                "blueprint_id": blueprint.id,
+                "blueprint_version": blueprint.version,
                 "values": values,
             }))?
             .map_err(|error| rejected("create_refused", error, None))?;
@@ -291,30 +299,10 @@ pub fn apply_client(
         .as_str()
         .ok_or_else(|| rejected("invalid_mapping", "mapping without record".into(), None))?
         .to_owned();
-    if let Mode::Run { .. } = mode {
-        let remote = local_projection(sync, &remote_values(sync, client));
-        let values: Vec<Value> = sync
-            .fields
-            .iter()
-            .filter(|mapping| mapping.owner.pulls())
-            .map(|mapping| {
-                let value = remote.get(&mapping.field).map(String::as_str);
-                host::scalar(&mapping.attribute, &sync.context_id, value)
-            })
-            .collect();
-        mode.command(json!({
-            "kind": "update",
-            "intent_key": intent_key("update", &id, updated_at),
-            "record_id": record_id,
-            "values": values,
-        }))?
-        .map_err(|error| rejected("update_refused", error, Some(&record_id)))?;
-        // The record's other fields are unknown here, so the agreed hash is
-        // left as it was; the next local edit compares against it and pushes.
-        host::commit(&record_id, json!({"status": SYNCED, "external_id": id}))?;
-        return Ok(Applied::Updated(record_id));
-    }
-    let local = local_projection(sync, &host::resolved_values(&record_id, &sync.context_id)?);
+    let local = local_projection(
+        sync,
+        &host::read_record(mode, &record_id, Some(&context_id))?.values,
+    );
     let merge = merge_inbound(sync, &local, client);
     let hash = projection_hash(&merge.projection);
     if merge.writes.is_empty() {
@@ -323,19 +311,23 @@ pub fn apply_client(
         }
         return Ok(Applied::Unchanged);
     }
-    let values: Vec<Value> = merge
-        .writes
-        .iter()
-        .map(|write| host::scalar(&write.attribute, &sync.context_id, write.value.as_deref()))
-        .collect();
+    let mut values = Vec::new();
+    let mut remove_values = Vec::new();
+    for write in &merge.writes {
+        match &write.value {
+            Some(value) => values.push(host::scalar(&write.attribute, &context_id, value)),
+            None => remove_values.push(host::cleared(&write.attribute, &context_id)),
+        }
+    }
     mode.command(json!({
         "kind": "update",
         "intent_key": intent_key("update", &id, updated_at),
         "record_id": record_id,
         "values": values,
+        "remove_values": remove_values,
     }))?
     .map_err(|error| rejected("update_refused", error, Some(&record_id)))?;
-    let revision = host::read_record(&record_id)?.content_revision;
+    let revision = host::read_record(mode, &record_id, None)?.content_revision;
     host::commit(
         &record_id,
         json!({"status": SYNCED, "external_id": id, "content_hash": hash,

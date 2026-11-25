@@ -8,7 +8,7 @@ use serde_json::{Map, Value, json};
 
 use attricat_fakturownia_sync_core::Config;
 
-use crate::attricat::host::api::{self, ReadRequest, RecordReference, ResolvedRead};
+use crate::attricat::host::api;
 use crate::attricat::host::attricat_data;
 
 /// The `source-name` of events caused by this extension's own writes.
@@ -45,91 +45,133 @@ pub fn log(level: &str, message: &str) {
 
 // ---------------------------------------------------------------- catalog
 
+/// Where catalog reads and writes go. Event handlers use the JSON
+/// `attricat.read.v1` and `attricat.command.v1` calls; operation runs may not,
+/// and reach the same JSON through the run-scoped `attricat-data` interface,
+/// writing under the run's current batch key.
+pub enum Mode<'a> {
+    Handler,
+    Run { batch_key: &'a str },
+}
+
+impl Mode<'_> {
+    /// One `attricat.read` request.
+    pub fn read(&self, request: &Value) -> Result<Value, String> {
+        match self {
+            Mode::Handler => call("attricat.read.v1", request),
+            Mode::Run { .. } => decode(&attricat_data::read(&request.to_string())?, "read"),
+        }
+    }
+
+    /// One applied intent: the record it touched, or why it was refused.
+    pub fn command(&self, intent: Value) -> Result<Result<String, String>, String> {
+        let intent_key = intent["intent_key"].as_str().unwrap_or_default().to_owned();
+        let batch_key = match self {
+            Mode::Handler => intent_key.as_str(),
+            Mode::Run { batch_key } => batch_key,
+        };
+        let request = json!({"operation": "batch", "batch": {
+            "batch_key": batch_key,
+            "dry_run": false,
+            "intents": [intent],
+        }});
+        let outcomes: Value = match self {
+            Mode::Handler => call("attricat.command.v1", &request)?,
+            Mode::Run { .. } => decode(
+                &attricat_data::batch(&request.to_string())?,
+                "batch outcome",
+            )?,
+        };
+        let outcome = &outcomes[0];
+        Ok(match outcome["status"].as_str() {
+            Some("applied" | "already_applied") => {
+                Ok(outcome["record_id"].as_str().unwrap_or_default().to_owned())
+            }
+            _ => Err(outcome["error"]
+                .as_str()
+                .unwrap_or("intent rejected")
+                .to_owned()),
+        })
+    }
+}
+
+/// The configured blueprint's current published revision.
+pub struct Blueprint {
+    pub id: String,
+    pub version: i64,
+}
+
+/// The current revision of the blueprint with `code`, or `None`.
+pub fn blueprint(mode: &Mode, code: &str) -> Result<Option<Blueprint>, String> {
+    let found = mode.read(&json!({"operation": "blueprint", "code": code}))?;
+    let blueprint = &found["blueprint"];
+    Ok(
+        match (blueprint["id"].as_str(), blueprint["version"].as_i64()) {
+            (Some(id), Some(version)) => Some(Blueprint {
+                id: id.to_owned(),
+                version,
+            }),
+            _ => None,
+        },
+    )
+}
+
+/// The ID of the context with `code`, or `None`.
+pub fn context(mode: &Mode, code: &str) -> Result<Option<String>, String> {
+    let found = mode.read(&json!({"operation": "context", "code": code}))?;
+    Ok(found["id"].as_str().map(str::to_owned))
+}
+
 pub struct Record {
-    pub blueprint_id: String,
+    /// The code of the record's blueprint.
+    pub blueprint: String,
     pub content_revision: Option<i64>,
     pub deleted: bool,
+    /// Values resolved in the requested context, keyed by attribute code;
+    /// empty when no context was requested.
+    pub values: Map<String, Value>,
 }
 
-pub fn read_record(record_id: &str) -> Result<Record, String> {
-    let response = api::read(&ReadRequest::Record(RecordReference {
-        record_id: record_id.into(),
-    }))?;
-    let record: Value = decode(&response.record, "record")?;
-    let blueprint: Value = decode(&response.blueprint, "blueprint")?;
-    Ok(Record {
-        blueprint_id: record["blueprint_id"]
-            .as_str()
-            .or_else(|| blueprint["id"].as_str())
-            .unwrap_or_default()
-            .to_owned(),
-        content_revision: record["content_revision"].as_i64(),
-        deleted: !record["deleted_at"].is_null(),
-    })
-}
-
-/// Values resolved in `context_id`, keyed by attribute code.
-pub fn resolved_values(record_id: &str, context_id: &str) -> Result<Map<String, Value>, String> {
-    let response = api::read(&ReadRequest::Resolved(ResolvedRead {
-        record_id: record_id.into(),
-        context_id: context_id.into(),
-    }))?;
-    let resolved: Value = decode(
-        &response
-            .resolved_values
-            .ok_or_else(|| "The host returned no resolved values.".to_owned())?,
-        "resolved values",
-    )?;
+/// One record, with its values resolved in `context_id` when one is given.
+pub fn read_record(
+    mode: &Mode,
+    record_id: &str,
+    context_id: Option<&str>,
+) -> Result<Record, String> {
+    let read = mode.read(&json!({"operation": "record", "record_id": record_id,
+        "context_id": context_id}))?;
+    let record = &read["record"];
     // `values` maps each code to `{value, source_context}`.
-    Ok(resolved
-        .get("values")
-        .and_then(Value::as_object)
+    let values = read["resolved_values"]["values"]
+        .as_object()
         .map(|values| {
             values
                 .iter()
                 .map(|(code, entry)| (code.clone(), entry["value"].clone()))
                 .collect()
         })
-        .unwrap_or_default())
-}
-
-/// One applied intent: the record it touched. Outside operation runs it goes
-/// through `attricat.command.v1`; inside one, through `attricat-data.batch`
-/// under the run's current batch key.
-pub fn command(
-    intent: Value,
-    run_batch_key: Option<&str>,
-) -> Result<Result<String, String>, String> {
-    let intent_key = intent["intent_key"].as_str().unwrap_or_default().to_owned();
-    let request = json!({"operation": "batch", "batch": {
-        "batch_key": run_batch_key.unwrap_or(&intent_key),
-        "dry_run": false,
-        "intents": [intent],
-    }});
-    let outcomes: Value = match run_batch_key {
-        None => call("attricat.command.v1", &request)?,
-        Some(_) => decode(
-            &attricat_data::batch(&request.to_string())?,
-            "batch outcome",
-        )?,
-    };
-    let outcome = &outcomes[0];
-    Ok(match outcome["status"].as_str() {
-        Some("applied" | "already_applied") => {
-            Ok(outcome["record_id"].as_str().unwrap_or_default().to_owned())
-        }
-        _ => Err(outcome["error"]
+        .unwrap_or_default();
+    Ok(Record {
+        blueprint: read["blueprint"]["blueprint"]["code"]
             .as_str()
-            .unwrap_or("intent rejected")
-            .to_owned()),
+            .unwrap_or_default()
+            .to_owned(),
+        content_revision: record["content_revision"].as_i64(),
+        deleted: !record["deleted_at"].is_null(),
+        values,
     })
 }
 
-/// A string value write. A cleared value is written as an empty string: the
-/// intent API refuses `null`, and the projection reads both as absent.
-pub fn scalar(attribute: &str, context_id: &str, value: Option<&str>) -> Value {
+/// A string value write.
+pub fn scalar(attribute: &str, context_id: &str, value: &str) -> Value {
     json!({"kind": "scalar", "attribute_code": attribute, "context_id": context_id,
-        "value": value.unwrap_or_default()})
+        "value": value})
+}
+
+/// A value to clear, for an intent's `remove_values`. Clearing works for any
+/// attribute type, unlike writing `null` (refused) or `""` (strings only).
+pub fn cleared(attribute: &str, context_id: &str) -> Value {
+    json!({"attribute_code": attribute, "context_id": context_id})
 }
 
 // ---------------------------------------------------------------- mappings

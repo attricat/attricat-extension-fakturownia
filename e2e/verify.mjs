@@ -11,6 +11,7 @@
 // EXTENSION_WEBHOOK_BASE_URL set.
 
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { request as httpsRequest } from 'node:https';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -153,13 +154,14 @@ for (const rule of manifest.host_permissions) {
   await api('POST', `/extensions/${extensionId}/grants`, { grant_kind: 'host_permission', grant_id: rule.id });
 }
 await api('PUT', '/workspace/extension-secrets/fakturownia-api-token', { value: mockToken });
-await api('PUT', `/extensions/${extensionId}/configure`, {
+// Configuration names the blueprint and the context by code; the extension
+// looks their IDs and the current blueprint revision up itself.
+const configuration = (blueprintCodeInConfig) => ({
   configuration: {
     account,
     clients: {
-      blueprint_id: blueprint.id,
-      blueprint_version: blueprint.version,
-      context_id: context.id,
+      blueprint: blueprintCodeInConfig,
+      context: 'default',
       fields: [
         { field: 'name', attribute: 'name', owner: 'both' },
         { field: 'tax_no', attribute: 'nip', owner: 'attricat' },
@@ -169,6 +171,7 @@ await api('PUT', `/extensions/${extensionId}/configure`, {
     },
   },
 });
+await api('PUT', `/extensions/${extensionId}/configure`, configuration(blueprintCode));
 await api('POST', `/extensions/${extensionId}/enable`);
 
 step('create a webhook endpoint and register it in Fakturownia');
@@ -203,6 +206,11 @@ const values = async (recordId) => {
   );
 };
 const mapping = async (recordId) => (await api('GET', `/v1/records/${recordId}/export-status`)).statuses?.[0];
+/** The agreed-state hash of a projection, as sync-core computes it. */
+const projectionHash = (projection) => {
+  const sorted = Object.fromEntries(Object.entries(projection).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)));
+  return createHash('sha256').update(JSON.stringify(sorted)).digest('hex');
+};
 
 step('a new Attricat client is created in Fakturownia');
 const acme = (await api('POST', '/v1/records', {
@@ -257,16 +265,29 @@ assert.deepEqual(await values(newcomer), { name: 'Nowy Klient SA', nip: '1130000
 
 step('emptying a field in Fakturownia clears it in Attricat');
 await mock('PATCH', `/ui/${account}/clients/${newcomerId}`, { email: '' });
-await waitFor('the cleared email', async () => !(await values(newcomer)).email);
+await waitFor('the cleared email', async () => !('email' in (await values(newcomer))));
+// Removed through remove_values, not overwritten with an empty string.
+assert.deepEqual(await values(newcomer), { name: 'Nowy Klient SA', nip: '1130000000', city: 'Łódź' });
 
 step('a lost webhook is caught up by the pull operation');
 await mock('POST', '/webhooks/pause', { paused: true });
-await mock('PATCH', `/ui/${account}/clients/${remote.id}`, { name: 'Acme Polska sp. z o.o.' });
+const putsBeforePull = (await requests()).filter((request) => request.method === 'PUT').length;
+await mock('PATCH', `/ui/${account}/clients/${remote.id}`, { name: 'Acme Polska sp. z o.o.', city: '', tax_no: '1111111111' });
 await sleep(3000);
 assert.equal((await values(acme)).name, 'Acme sp. z o.o.', 'nothing arrived while webhooks are paused');
 const caughtUp = await pull('catch-up');
 assert.equal(caughtUp.status, 'completed', JSON.stringify(caughtUp));
-assert.equal((await values(acme)).name, 'Acme Polska sp. z o.o.');
+// The run reads the record and merges: it clears the emptied city, keeps the
+// Attricat-owned NIP, and records the merged state as agreed.
+const merged = await values(acme);
+assert.deepEqual(merged, { name: 'Acme Polska sp. z o.o.', nip: '5250001009', email: 'biuro@acme.test' });
+assert.equal(
+  (await mapping(acme)).content_hash,
+  projectionHash({ name: merged.name, tax_no: merged.nip, email: merged.email }),
+  'the pull stored the merged projection as the agreed state',
+);
+await sleep(4000);
+assert.equal((await requests()).filter((request) => request.method === 'PUT').length, putsBeforePull, 'the pull wrote nothing back to Fakturownia');
 await mock('POST', '/webhooks/pause', { paused: false });
 
 step('a Fakturownia validation error rejects the record');
@@ -289,5 +310,12 @@ step('the token only ever travelled as a Bearer header');
 const all = await mock('GET', '/requests');
 assert(all.every((request) => request.bearer), 'every API request used Authorization: Bearer');
 assert(!JSON.stringify(all).includes(mockToken), 'the token never appears in a query or body');
+
+step('a pull refuses to start when no blueprint has the configured code');
+await api('PUT', `/extensions/${extensionId}/configure`, configuration(`no_such_${suffix}`));
+const misconfigured = await pull('misconfigured');
+assert.equal(misconfigured.status, 'dead_letter', JSON.stringify(misconfigured));
+assert(JSON.stringify(misconfigured).includes('no published blueprint has the code'), JSON.stringify(misconfigured));
+await api('PUT', `/extensions/${extensionId}/configure`, configuration(blueprintCode));
 
 console.log('\nAll checks passed');

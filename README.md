@@ -6,6 +6,11 @@ Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 > **Spike.** This release syncs **clients** only and has been tested against
 > the local mock in `mock/`, not a real Fakturownia account. The webhook
 > format in particular is assumed; see [Assumptions to verify](#assumptions-to-verify).
+>
+> 0.2.0 needs an Attricat Core newer than v1.4.0 (commit `fcfaef15` on
+> `main`): the `attricat.read` `record`, `blueprint` and `context` requests and
+> `remove_values` are JSON-level additions that `host_api` cannot express, and
+> older hosts refuse them.
 
 ## What it does
 
@@ -13,7 +18,7 @@ Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 | --- | --- | --- |
 | Attricat → Fakturownia | `record.created.v1` / `record.updated.v1` on the configured blueprint (debounced 2 s) push the client with `POST /clients.json` or `PUT /clients/{id}.json`. The export mapping keeps the Fakturownia ID and the hash of the last agreed state. | `sync.rs` (`push_record`) |
 | Fakturownia → Attricat | A Fakturownia webhook is a **hint**: `receive` checks it and keeps only `{resource, action, id}`; the `webhook.received.v1` handler fetches the client again with `GET /clients/{id}.json` and applies it. A forged request costs one GET at most. | `webhook.rs`, `sync.rs` (`apply_client`) |
-| Safety net | The `pull` operation pages `GET /clients.json?order=updated_at.desc` back to the watermark of the previous run (Fakturownia has no "changed since" filter) and applies what it finds. Run it on a schedule. | `pull.rs` |
+| Safety net | The `pull` operation pages `GET /clients.json?order=updated_at.desc` back to the watermark of the previous run (Fakturownia has no "changed since" filter) and applies what it finds, merging exactly as the webhook path does. Run it on a schedule. | `pull.rs` |
 
 Each mapped field has an **owner**:
 
@@ -28,6 +33,8 @@ Creating a client seeds every mapped field.
 - A push whose projection is unchanged is skipped. This covers the events caused by the extension's own writes, which are also skipped by `source-name`.
 - An inbound change that leaves the projection unchanged writes nothing. This covers the webhook announcing our own push.
 
+Inbound changes, from a webhook or from `pull`, read the record, write only the fields that differ, and store the merged projection as the agreed state. A field emptied in Fakturownia is removed from the record (`remove_values`), not overwritten with an empty string.
+
 **API token.** It lives in an extension secret and is sent only as a host-substituted `Authorization: Bearer` header. It never enters component memory, a URL or a log.
 
 Validation errors (HTTP 422) become the record's export status `rejected`, with Fakturownia's field messages.
@@ -40,9 +47,8 @@ Validation errors (HTTP 422) become the record's export status `rejected`, with 
   "token_secret": "fakturownia-api-token",
   "verify_webhook_token": true,
   "clients": {
-    "blueprint_id": "<blueprint UUID>",
-    "blueprint_version": 1,
-    "context_id": "<context UUID>",
+    "blueprint": "client",
+    "context": "default",
     "fields": [
       {"field": "name", "attribute": "name", "owner": "both"},
       {"field": "tax_no", "attribute": "nip", "owner": "attricat"},
@@ -52,6 +58,8 @@ Validation errors (HTTP 422) become the record's export status `rejected`, with 
   }
 }
 ```
+
+`blueprint` and `context` are codes. The extension looks up their IDs, and creates records on the blueprint's current published revision, so publishing a new revision needs no reconfiguration. `context` defaults to `default`. A `pull` whose blueprint or context does not exist fails before it fetches anything.
 
 The supported client fields are `name`, `tax_no`, `email`, `phone`, `street`, `city`, `post_code` and `country`.
 
@@ -91,21 +99,23 @@ It side-loads the archive, configures a fresh blueprint, registers the webhook e
 - that the create webhook's echo neither writes nor pushes again
 - field ownership in both directions
 - a client created in Fakturownia becoming a record
-- clearing a field
-- a lost webhook caught up by `pull`
+- clearing a field (the value is removed, not set to `""`)
+- a lost webhook caught up by `pull`, which merges: it clears an emptied field, keeps Attricat-owned ones, stores the merged hash and pushes nothing back
 - a 422 rejection
 - a forged webhook refused
 - that the token travelled only as a Bearer header
+- a `pull` refused when the configured blueprint code does not exist
 
 ## Spike findings
 
 Found while building against the host. These need Core work or a decision.
+Reading records from operation runs, looking up blueprints and contexts by
+code, and clearing values of any type were added to Core after the spike
+(`attricat.read` `record`, `blueprint` and `context`; intents' `remove_values`)
+and are used since 0.2.0. They are JSON-level, so the vendored WIT is unchanged.
 
-1. **Operation runs cannot read a single record's values.** `api.read` and `attricat.command.v1` are refused inside runs ("operation runs access catalog data through their run-scoped interfaces"), and `attricat-data.read` has no record read. `pull` therefore cannot merge: it writes every field Fakturownia may change and leaves the agreed hash alone. An extension also cannot consume its own event contract, so a run cannot hand work to the event handler either.
-2. **No blueprint or context lookup by code.** The configuration needs the blueprint UUID and version and the context UUID. Creating records also needs the current blueprint version.
-3. **Clearing a value.** Intents refuse `null` ("value does not match the attribute type"). The extension writes `""`, which is right only for string attributes.
-4. **Mappings outlive the installation.** Removing the extension keeps its export mappings, so a re-installation pointed at another Fakturownia account would match the old external IDs. With a static API token there is no connection to scope mappings by; a fixed-token connection kind in Core would fix this and allow several accounts.
-5. **Attricat-owned fields edited in Fakturownia stay diverged.** The inbound path ignores them, and the extension's own writes never trigger a push, so nothing restores them until the next Attricat edit. A pull could push them back; that is a policy decision.
+1. **Mappings outlive the installation.** Removing the extension keeps its export mappings, so a re-installation pointed at another Fakturownia account would match the old external IDs. With a static API token there is no connection to scope mappings by; a fixed-token connection kind in Core would fix this and allow several accounts.
+2. **Attricat-owned fields edited in Fakturownia stay diverged.** The inbound path ignores them, and the extension's own writes never trigger a push, so nothing restores them until the next Attricat edit. A pull could push them back; that is a policy decision.
 
 ## Assumptions to verify
 

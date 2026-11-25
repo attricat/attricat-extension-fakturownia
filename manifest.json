@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "Fakturownia",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Two-way sync of clients between Attricat and Fakturownia (spike).",
   "icons": {
     "48": "assets/icon-48.svg"
@@ -50,7 +50,7 @@
     }
   ],
   "configuration": {
-    "version": 1,
+    "version": 2,
     "schema": {
       "type": "object",
       "additionalProperties": false,
@@ -78,25 +78,21 @@
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "blueprint_id",
-            "blueprint_version",
-            "context_id",
+            "blueprint",
             "fields"
           ],
           "properties": {
-            "blueprint_id": {
+            "blueprint": {
               "type": "string",
-              "minLength": 36,
-              "maxLength": 36
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "maxLength": 64,
+              "description": "Code of the blueprint whose records are Fakturownia clients. New records use its current published revision."
             },
-            "blueprint_version": {
-              "type": "integer",
-              "minimum": 1
-            },
-            "context_id": {
+            "context": {
               "type": "string",
-              "minLength": 36,
-              "maxLength": 36
+              "maxLength": 64,
+              "description": "Code of the context values are read and written in (default default).",
+              "minLength": 1
             },
             "fields": {
               "type": "array",

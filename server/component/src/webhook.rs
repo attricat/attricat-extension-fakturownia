@@ -128,7 +128,7 @@ pub fn handle_received(event: &Event) -> Result<(), Failure> {
     let config = host::config()?;
     match sync::fetch_client(&config, id)? {
         Some(client) => {
-            let applied = sync::apply_client(&config, &client, &sync::Mode::Handler)?;
+            let applied = sync::apply_client(&config, &client, &host::Mode::Handler)?;
             if applied != Applied::Unchanged {
                 host::log("info", &format!("applied client {id}: {applied:?}"));
             }

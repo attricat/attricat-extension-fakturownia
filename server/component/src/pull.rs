@@ -13,7 +13,7 @@ use attricat_fakturownia_sync_core::timestamp_millis;
 use crate::attricat::host::clock;
 use crate::attricat::host::outcomes::{Failure, Retry};
 use crate::exports::attricat::host::deferrable_operations::{BatchOutcome, OperationRequest};
-use crate::host::{self, Http, decode, encode};
+use crate::host::{self, Http, Mode, decode, encode};
 use crate::sync;
 
 pub const OPERATION: &str = "pull";
@@ -38,8 +38,24 @@ fn retry(message: &str, after_ms: u64) -> Failure {
     })
 }
 
-pub fn prepare(_request: &OperationRequest) -> Result<String, String> {
-    host::config()?;
+/// Refuses to start, with a JSON error, when the configured blueprint or context does not exist.
+pub fn prepare(request: &OperationRequest) -> Result<String, String> {
+    let config = host::config()?;
+    let mode = Mode::Run {
+        batch_key: &request.batch_key,
+    };
+    // The host keeps a run's error only when it is JSON; plain text is
+    // redacted, which would hide why the run failed.
+    let missing = |failure: Failure| {
+        let (code, message) = match failure {
+            Failure::Rejected(rejection) => (rejection.code, rejection.message),
+            Failure::Retry(retry) => ("unavailable".to_owned(), retry.message),
+            Failure::Fault(message) => ("fault".to_owned(), message),
+        };
+        json!({"code": code, "message": message}).to_string()
+    };
+    sync::blueprint(&config, &mode).map_err(missing)?;
+    sync::context_id(&config, &mode).map_err(missing)?;
     Ok("prepared".into())
 }
 
@@ -87,7 +103,7 @@ pub fn process_batch(request: &OperationRequest) -> Result<BatchOutcome, Failure
                 let applied = sync::apply_client(
                     &config,
                     object,
-                    &sync::Mode::Run {
+                    &Mode::Run {
                         batch_key: &request.batch_key,
                     },
                 )

@@ -74,13 +74,20 @@ pub struct FieldMapping {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientSync {
-    /// The blueprint whose records are Fakturownia clients.
-    pub blueprint_id: String,
-    /// The revision new records are created on.
-    pub blueprint_version: i64,
-    /// The context values are read and written in.
-    pub context_id: String,
+    /// The code of the blueprint whose records are Fakturownia clients. New
+    /// records are created on its current published revision.
+    pub blueprint: String,
+    /// The code of the context values are read and written in.
+    #[serde(default = "default_context")]
+    pub context: String,
     pub fields: Vec<FieldMapping>,
+}
+
+/// The context used when configuration names none.
+pub const DEFAULT_CONTEXT: &str = "default";
+
+fn default_context() -> String {
+    DEFAULT_CONTEXT.to_owned()
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -118,6 +125,9 @@ impl Config {
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
         if !account_ok {
             return Err("account must be a Fakturownia subdomain (a-z, 0-9, -)".into());
+        }
+        if self.clients.blueprint.is_empty() || self.clients.context.is_empty() {
+            return Err("clients.blueprint and clients.context must be codes".into());
         }
         if self.clients.fields.is_empty() {
             return Err("clients.fields maps no field".into());
@@ -426,9 +436,8 @@ mod tests {
 
     fn sync() -> ClientSync {
         ClientSync {
-            blueprint_id: "b".into(),
-            blueprint_version: 1,
-            context_id: "c".into(),
+            blueprint: "client".into(),
+            context: DEFAULT_CONTEXT.into(),
             fields: vec![
                 FieldMapping {
                     field: "name".into(),
@@ -539,8 +548,8 @@ mod tests {
     #[test]
     fn configuration_rejects_unknown_and_duplicate_fields() {
         let config = |fields: Value, account: &str| {
-            json!({"account": account, "clients": {"blueprint_id": "b",
-                "blueprint_version": 1, "context_id": "c", "fields": fields}})
+            json!({"account": account, "clients": {"blueprint": "client",
+                "fields": fields}})
             .to_string()
         };
         assert!(
@@ -549,6 +558,21 @@ mod tests {
                 "acme"
             ))
             .is_ok()
+        );
+        let parsed = Config::parse(&config(
+            json!([{"field": "name", "attribute": "name"}]),
+            "acme",
+        ))
+        .unwrap();
+        assert_eq!(parsed.clients.context, "default");
+        assert!(
+            Config::parse(
+                &json!({"account": "acme", "clients": {"blueprint_id": "b",
+                    "fields": [{"field": "name", "attribute": "name"}]}})
+                .to_string()
+            )
+            .is_err(),
+            "the UUID form of earlier releases is refused"
         );
         assert!(
             Config::parse(&config(
