@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "Fakturownia",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Two-way sync of clients, and sales invoices issued from Attricat records, between Attricat and Fakturownia (spike).",
   "icons": {
     "48": "assets/icon-48.svg"
@@ -445,7 +445,7 @@
       "id": "issue-invoice",
       "version": 1,
       "kind": "action",
-      "outlet": "record_header_action",
+      "outlet": "record_header_action", "view": "detail",
       "title": "Issue invoice in Fakturownia",
       "translations": {
         "pl": {
@@ -466,7 +466,7 @@
       "id": "issue-invoices",
       "version": 1,
       "kind": "action",
-      "outlet": "explorer_bulk_action",
+      "outlet": "explorer_bulk_action", "view": "table",
       "title": "Issue invoice in Fakturownia",
       "translations": {
         "pl": {

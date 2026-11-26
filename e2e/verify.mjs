@@ -329,6 +329,8 @@ name: ${name} ${suffix}
 kind: record
 views:
   dropdown_option: {type: dropdown_option, fields: [${attributes.match(/code: (\w+)/)[1]}]}
+  detail: {type: stack, extensions: [${extensionId}/issue-invoice]}
+  table: {type: table, extensions: [${extensionId}/issue-invoices]}
 attributes:
 ${attributes}`;
 await publish(recordBlueprint(codes.unit, 'Unit', `  - {code: code, value_type: string}\n`));

@@ -54,6 +54,24 @@ An invoice is issued from a **source** record: a sales order whose lines are rec
 - **Deleted invoices.** A deleted invoice clears the scalar write-back fields (`remove_values`) and removes the mapping. The PDF stays on the record. The extension never deletes an invoice itself, paid or not. `pull` cannot see deletions (Fakturownia does not list deleted invoices), so only the webhook clears them.
 - **Invoices made in Fakturownia.** With `link_existing_by_oid`, an invoice whose `oid` equals exactly one source record's order-number attribute (an `attricat.read` `lookup`) is linked to it: mapping and write-back, as if it had been issued from Attricat. Several matches are logged and skipped, as is a record that already has an invoice.
 
+## Show the actions on a blueprint
+
+**Issue invoice in Fakturownia** appears on records, and the bulk action in the
+Explorer, only for blueprints whose views list them (Attricat 1.8 or later):
+
+```yaml
+views:
+  detail:
+    type: stack
+    extensions: [attricat-fakturownia/issue-invoice]
+  table:
+    type: table
+    extensions: [attricat-fakturownia/issue-invoices]
+```
+
+A `detail` stack without `children` keeps the default record layout, and a
+`table` without `columns` the default Explorer columns.
+
 ## Configuration
 
 ```json
