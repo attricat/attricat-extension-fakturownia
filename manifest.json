@@ -1,8 +1,8 @@
 {
   "manifest_version": 1,
   "name": "Fakturownia",
-  "version": "0.2.0",
-  "description": "Two-way sync of clients between Attricat and Fakturownia (spike).",
+  "version": "0.3.0",
+  "description": "Two-way sync of clients, and sales invoices issued from Attricat records, between Attricat and Fakturownia (spike).",
   "icons": {
     "48": "assets/icon-48.svg"
   },
@@ -20,7 +20,11 @@
     "storage.extension",
     "configuration.read",
     "logging.write",
-    "webhooks.receive"
+    "webhooks.receive",
+    "artifacts.read",
+    "client.record_header_action",
+    "client.explorer_bulk_action",
+    "client.operations.start"
   ],
   "host_permissions": [
     {
@@ -39,7 +43,8 @@
         "requests": 60,
         "per_seconds": 60,
         "burst": 20
-      }
+      },
+      "max_transfer_bytes": 16777216
     }
   ],
   "artifacts": [
@@ -134,6 +139,252 @@
               }
             }
           }
+        },
+        "invoices": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "source",
+            "buyer",
+            "positions"
+          ],
+          "properties": {
+            "source": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "blueprint"
+              ],
+              "properties": {
+                "blueprint": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64,
+                  "description": "Code of the blueprint invoices are issued from, such as a sales order."
+                },
+                "context": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64,
+                  "description": "Code of the context values are read and written in (default default)."
+                }
+              }
+            },
+            "buyer": {
+              "type": "string",
+              "pattern": "^[a-z][a-z0-9_]*$",
+              "maxLength": 64,
+              "description": "Relationship on the source to a record of the clients blueprint."
+            },
+            "header": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "kind": {
+                  "enum": [
+                    "vat",
+                    "bill"
+                  ],
+                  "description": "Fakturownia invoice kind (default vat)."
+                },
+                "issue_date": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64,
+                  "description": "Date attribute on the source; null lets Fakturownia use today."
+                },
+                "sell_date": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64,
+                  "description": "Date attribute on the source; null lets Fakturownia use today."
+                },
+                "oid": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64,
+                  "description": "Attribute holding the source's number, sent as the order number; null sends the record ID."
+                },
+                "description": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64,
+                  "description": "Attribute sent as the invoice description; null sends none."
+                },
+                "payment_to_days": {
+                  "type": [
+                    "integer",
+                    "null"
+                  ],
+                  "minimum": 0,
+                  "maximum": 365
+                },
+                "payment_type": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "maxLength": 64
+                },
+                "currency": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[A-Z]{3}$"
+                }
+              }
+            },
+            "positions": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "quantity",
+                "price_net",
+                "tax"
+              ],
+              "properties": {
+                "lines": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "blueprint",
+                    "parent"
+                  ],
+                  "properties": {
+                    "blueprint": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_]*$",
+                      "maxLength": 64,
+                      "description": "Code of the line blueprint."
+                    },
+                    "parent": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_]*$",
+                      "maxLength": 64,
+                      "description": "Relationship on a line to its source record."
+                    }
+                  }
+                },
+                "name": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                  "maxLength": 259
+                },
+                "code": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                  "maxLength": 259
+                },
+                "quantity": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                  "maxLength": 259
+                },
+                "unit": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                  "maxLength": 259
+                },
+                "price_net": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                  "maxLength": 259
+                },
+                "tax": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "attribute": {
+                      "type": "string",
+                      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*){0,3}$",
+                      "maxLength": 259
+                    },
+                    "default": {
+                      "enum": [
+                        "23",
+                        "8",
+                        "5",
+                        "0",
+                        "zw",
+                        "np"
+                      ]
+                    }
+                  }
+                }
+              }
+            },
+            "write_back": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "number": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "status": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "url": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "ksef_number": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "ksef_status": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                },
+                "file": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "pattern": "^[a-z][a-z0-9_]*$",
+                  "maxLength": 64
+                }
+              }
+            },
+            "link_existing_by_oid": {
+              "type": "boolean"
+            }
+          }
         }
       }
     }
@@ -160,7 +411,7 @@
     "webhooks": [
       {
         "id": "fakturownia",
-        "title": "Fakturownia changes",
+        "title": "Fakturownia changes (clients and invoices)",
         "max_body_bytes": 262144
       }
     ],
@@ -173,7 +424,65 @@
           "additionalProperties": false
         },
         "max_checkpoint_bytes": 4096
+      },
+      {
+        "id": "issue-invoices",
+        "handler": "issue-invoices",
+        "request_schema": {
+          "type": "object",
+          "additionalProperties": false
+        },
+        "max_checkpoint_bytes": 65536,
+        "interactive": {
+          "version": 1,
+          "max_selection": 50
+        }
       }
     ]
-  }
+  },
+  "ui": [
+    {
+      "id": "issue-invoice",
+      "version": 1,
+      "kind": "action",
+      "outlet": "record_header_action",
+      "title": "Issue invoice in Fakturownia",
+      "translations": {
+        "pl": {
+          "title": "Wystaw fakturę w Fakturowni"
+        }
+      },
+      "invoke": {
+        "operation": {
+          "id": "issue-invoices",
+          "input": {}
+        }
+      },
+      "when": {
+        "requires_write": true
+      }
+    },
+    {
+      "id": "issue-invoices",
+      "version": 1,
+      "kind": "action",
+      "outlet": "explorer_bulk_action",
+      "title": "Issue invoice in Fakturownia",
+      "translations": {
+        "pl": {
+          "title": "Wystaw fakturę w Fakturowni"
+        }
+      },
+      "invoke": {
+        "operation": {
+          "id": "issue-invoices",
+          "input": {}
+        }
+      },
+      "when": {
+        "requires_write": true,
+        "max_records": 50
+      }
+    }
+  ]
 }

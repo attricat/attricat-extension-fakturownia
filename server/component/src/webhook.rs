@@ -18,6 +18,7 @@ use crate::exports::attricat::host::webhook_receiver::{
     KeptPayload, WebhookHeader, WebhookOutcome, WebhookReply, WebhookRequest,
 };
 use crate::host::{self, decode};
+use crate::invoices;
 use crate::sync::{self, Applied};
 
 /// The manifest webhook this module answers.
@@ -115,28 +116,41 @@ pub fn handle_received(event: &Event) -> Result<(), Failure> {
         ));
     };
     let kept: Value = decode(payload, "kept webhook")?;
-    if kept["resource"] != Resource::Client.name() {
-        host::log(
-            "info",
-            &format!("webhook for {} not synced yet", kept["resource"]),
-        );
-        return Ok(());
-    }
     let id = kept["id"]
         .as_i64()
         .ok_or_else(|| rejected("invalid_payload", "missing id".into()))?;
     let config = host::config()?;
-    match sync::fetch_client(&config, id)? {
-        Some(client) => {
-            let applied = sync::apply_client(&config, &client, &host::Mode::Handler)?;
-            if applied != Applied::Unchanged {
-                host::log("info", &format!("applied client {id}: {applied:?}"));
+    let mode = host::Mode::Handler;
+    match kept["resource"].as_str() {
+        Some(resource) if resource == Resource::Client.name() => {
+            match sync::fetch_client(&config, id)? {
+                Some(client) => {
+                    let applied = sync::apply_client(&config, &client, &mode)?;
+                    if applied != Applied::Unchanged {
+                        host::log("info", &format!("applied client {id}: {applied:?}"));
+                    }
+                }
+                None => host::log(
+                    "info",
+                    &format!("client {id} no longer exists in Fakturownia"),
+                ),
             }
         }
-        None => host::log(
-            "info",
-            &format!("client {id} no longer exists in Fakturownia"),
-        ),
+        // Every invoice webhook, a delete too, is checked against the API.
+        Some(resource) if resource == Resource::Invoice.name() => {
+            match invoices::fetch_invoice(&config, &id.to_string())? {
+                Some(invoice) => {
+                    let applied = invoices::apply_invoice(&config, &invoice, &mode)?;
+                    host::log("info", &format!("applied invoice {id}: {applied:?}"));
+                }
+                None => {
+                    if invoices::deleted(&config, &id.to_string(), &mode)? {
+                        host::log("info", &format!("invoice {id} was deleted in Fakturownia"));
+                    }
+                }
+            }
+        }
+        other => host::log("info", &format!("webhook for {other:?} not synced")),
     }
     Ok(())
 }

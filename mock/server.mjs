@@ -16,6 +16,18 @@
 // webhooks too, the 201 status of a create, and that clients store
 // `external_id`.
 //
+// Invoices follow the same documentation: `/invoices.json` CRUD with an
+// `invoice` root, `client_id`, `oid` and `oid_unique`, positions with
+// `name`/`code`/`quantity`/`quantity_unit`/`price_net`/`tax`, statuses
+// issued/sent/paid/partial/rejected, KSeF state in `gov_id`/`gov_status`, the
+// view at `/invoice/{token}`, `GET /invoices/{id}.pdf`, and list filters
+// `oid`, `client_id`, `number`, `period` and `order=updated_at.desc`.
+// ASSUMED: the invoice webhook kinds (`invoice:create|update|delete`) and
+// their body (`{kind, api_token, invoice: {...}}`), the 201 of a create, that
+// `oid` and `client_id` filter together, the 422 message of a duplicate
+// `oid`, that an omitted issue or sell date means today, and the number
+// format `FV <n>/<MM>/<YYYY>`. The mock never creates warehouse documents.
+//
 // Inspection API on http://127.0.0.1:9580 (no auth):
 //   GET  /state                       accounts, clients, webhooks, deliveries
 //   GET  /requests                    API requests received (no tokens)
@@ -24,7 +36,13 @@
 //   PATCH /ui/:account/clients/:id    edit a client as a user
 //   DELETE /ui/:account/clients/:id
 //   POST /webhooks/pause {paused}     stop delivering webhooks (lost deliveries)
-//   POST /fail {method, path, status, count}  fail the next matching requests
+//   POST /ui/:account/invoices        create an invoice as a user
+//   PATCH /ui/:account/invoices/:id   edit an invoice (status, gov_id, ...)
+//   DELETE /ui/:account/invoices/:id  delete an invoice as a user
+//   POST /fail {method, path, status, count, body?, drop?}  fail the next
+//        matching requests; `body` replaces the error body (a 422's field
+//        messages), and `drop` applies the request but resets the connection
+//        instead of answering (a lost response)
 
 import { createServer as createHttpsServer } from 'node:https';
 import { createServer as createHttpServer } from 'node:http';
@@ -36,6 +54,8 @@ const INSPECT_PORT = Number(process.env.MOCK_INSPECT_PORT ?? 9580);
 const TOKEN = process.env.MOCK_API_TOKEN ?? 'mock-api-token';
 const MAX_PER_PAGE = 100;
 const DEFAULT_PER_PAGE = 25;
+const INVOICE_FIELDS = ['kind', 'client_id', 'oid', 'issue_date', 'sell_date', 'description', 'payment_to_kind', 'payment_type', 'currency', 'status', 'gov_id', 'gov_status', 'exclude_from_stock_level', 'positions'];
+const POSITION_FIELDS = ['name', 'code', 'quantity', 'quantity_unit', 'price_net', 'tax', 'product_id'];
 const CLIENT_FIELDS = ['name', 'tax_no', 'email', 'phone', 'street', 'city', 'post_code', 'country', 'external_id'];
 const STATUS = { ok: 200, created: 201, noContent: 204, badRequest: 400, unauthorized: 401, notFound: 404, unprocessable: 422 };
 
@@ -50,7 +70,7 @@ const reset = () => {
 reset();
 
 const account = (name) => {
-  state.accounts[name] ??= { clients: {}, webhooks: {} };
+  state.accounts[name] ??= { clients: {}, invoices: {}, webhooks: {}, invoiceCount: 0 };
   return state.accounts[name];
 };
 
@@ -83,11 +103,12 @@ const pick = (input = {}) =>
   Object.fromEntries(CLIENT_FIELDS.filter((field) => field in input).map((field) => [field, input[field] ?? '']));
 
 /** Sends `kind` to every matching webhook of the account, fire and forget. */
-const fire = (accountName, kind, client) => {
+const fire = (accountName, kind, object) => {
+  const resource = kind.split(':')[0];
   const { webhooks } = account(accountName);
   for (const hook of Object.values(webhooks)) {
     if (hook.kind !== kind || hook.active === false) continue;
-    const delivery = { webhook_id: hook.id, kind, client_id: client.id, url_path: new URL(hook.url).pathname };
+    const delivery = { webhook_id: hook.id, kind, object_id: object.id, url_path: new URL(hook.url).pathname };
     state.deliveries.push(delivery);
     if (state.paused) {
       delivery.status = 'paused';
@@ -96,7 +117,7 @@ const fire = (accountName, kind, client) => {
     fetch(hook.url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ kind, api_token: TOKEN, client }),
+      body: JSON.stringify({ kind, api_token: TOKEN, [resource]: object }),
     })
       .then(async (answer) => {
         delivery.status = answer.status;
@@ -138,11 +159,74 @@ const deleteClient = (accountName, id) => {
   return true;
 };
 
+const today = () => new Date(Date.now() + 60 * 60 * 1000).toISOString().slice(0, 10);
+
+const invoiceError = (fields) => ({ error: validationError(fields) });
+
+const createInvoice = (accountName, input = {}) => {
+  const store = account(accountName);
+  const positions = Array.isArray(input.positions) ? input.positions : [];
+  if (!positions.length) return invoiceError([['positions', 'nie może być puste']]);
+  const missing = positions.findIndex((position) => !String(position.name ?? '').trim());
+  if (missing >= 0) return invoiceError([[`positions[${missing}].name`, 'nie może być puste']]);
+  if (input.oid_unique === 'yes' && input.oid && Object.values(store.invoices).some((invoice) => invoice.oid === input.oid)) {
+    return invoiceError([['oid', 'jest już zajęte']]);
+  }
+  const id = state.nextId++;
+  const now = timestamp();
+  store.invoiceCount += 1;
+  const date = today();
+  const invoice = {
+    id,
+    kind: 'vat',
+    number: `FV ${store.invoiceCount}/${date.slice(5, 7)}/${date.slice(0, 4)}`,
+    status: 'issued',
+    gov_id: null,
+    gov_status: null,
+    issue_date: date,
+    sell_date: date,
+    ...Object.fromEntries(INVOICE_FIELDS.filter((field) => field in input).map((field) => [field, input[field]])),
+    client_id: input.client_id ?? null,
+    oid: input.oid ?? '',
+    token: Math.random().toString(36).slice(2, 14),
+    positions: positions.map((position, index) => ({
+      id: id * 100 + index,
+      ...Object.fromEntries(POSITION_FIELDS.filter((field) => field in position).map((field) => [field, position[field]])),
+    })),
+    warehouse_document_id: null,
+    created_at: now,
+    updated_at: now,
+  };
+  store.invoices[id] = invoice;
+  fire(accountName, 'invoice:create', invoice);
+  return { invoice };
+};
+
+const updateInvoice = (accountName, id, input = {}) => {
+  const invoice = account(accountName).invoices[id];
+  if (!invoice) return { missing: true };
+  for (const field of INVOICE_FIELDS.concat(['number'])) if (field in input) invoice[field] = input[field];
+  invoice.updated_at = timestamp();
+  fire(accountName, 'invoice:update', invoice);
+  return { invoice };
+};
+
+const deleteInvoice = (accountName, id) => {
+  const invoice = account(accountName).invoices[id];
+  if (!invoice) return false;
+  delete account(accountName).invoices[id];
+  fire(accountName, 'invoice:delete', invoice);
+  return true;
+};
+
+/** A minimal PDF naming the invoice. */
+const invoicePdf = (invoice) => Buffer.from(`%PDF-1.4\n% Fakturownia mock ${invoice.number}\n%%EOF\n`);
+
 const takeFailure = (method, path) => {
   const failure = state.failures.find((f) => f.count > 0 && f.method === method && path.startsWith(f.path));
   if (!failure) return null;
   failure.count -= 1;
-  return failure.status;
+  return failure;
 };
 
 const api = async (request, response) => {
@@ -163,10 +247,16 @@ const api = async (request, response) => {
   if (authorization !== `Bearer ${TOKEN}`) {
     return json(response, STATUS.unauthorized, { code: 'error', message: 'You must be logged in to gain access to the site' });
   }
-  const failed = takeFailure(request.method, url.pathname);
-  if (failed) return json(response, failed, { code: 'error', message: 'injected failure' });
+  const failure = takeFailure(request.method, url.pathname);
+  if (failure && !failure.drop) return json(response, failure.status, failure.body ?? { code: 'error', message: 'injected failure' });
   const input = body ? JSON.parse(body) : {};
-  const { clients, webhooks } = account(accountName);
+  const { clients, invoices, webhooks } = account(accountName);
+  if (failure?.drop) {
+    // Apply the request, then lose the answer.
+    if (url.pathname === '/invoices.json' && request.method === 'POST') createInvoice(accountName, input.invoice);
+    request.socket.destroy();
+    return;
+  }
   let match;
 
   if (url.pathname === '/clients.json' && request.method === 'GET') {
@@ -198,6 +288,43 @@ const api = async (request, response) => {
     }
     if (request.method === 'DELETE') {
       return deleteClient(accountName, id) ? json(response, STATUS.ok, {}) : json(response, STATUS.notFound, { code: 'error', message: 'not found' });
+    }
+  }
+  if (url.pathname === '/invoices.json' && request.method === 'GET') {
+    let list = Object.values(invoices);
+    for (const filter of ['oid', 'client_id', 'number']) {
+      const value = url.searchParams.get(filter);
+      if (value !== null) list = list.filter((invoice) => String(invoice[filter]) === value);
+    }
+    if (url.searchParams.get('order') === 'updated_at.desc') {
+      list.sort((a, b) => Date.parse(b.updated_at) - Date.parse(a.updated_at));
+    }
+    const perPage = Math.min(Number(url.searchParams.get('per_page') ?? DEFAULT_PER_PAGE), MAX_PER_PAGE);
+    const page = Number(url.searchParams.get('page') ?? 1);
+    return json(response, STATUS.ok, list.slice((page - 1) * perPage, page * perPage));
+  }
+  if (url.pathname === '/invoices.json' && request.method === 'POST') {
+    const { invoice, error } = createInvoice(accountName, input.invoice);
+    return error ? json(response, STATUS.unprocessable, error) : json(response, STATUS.created, invoice);
+  }
+  if ((match = url.pathname.match(/^\/invoices\/(\d+)\.pdf$/)) && request.method === 'GET') {
+    const invoice = invoices[Number(match[1])];
+    if (!invoice) return json(response, STATUS.notFound, { code: 'error', message: 'not found' });
+    const pdf = invoicePdf(invoice);
+    response.writeHead(STATUS.ok, { 'content-type': 'application/pdf', 'content-length': pdf.length });
+    return response.end(pdf);
+  }
+  if ((match = url.pathname.match(/^\/invoices\/(\d+)\.json$/))) {
+    const id = Number(match[1]);
+    if (request.method === 'GET') {
+      return invoices[id] ? json(response, STATUS.ok, invoices[id]) : json(response, STATUS.notFound, { code: 'error', message: 'not found' });
+    }
+    if (request.method === 'PUT') {
+      const { invoice, missing } = updateInvoice(accountName, id, input.invoice);
+      return missing ? json(response, STATUS.notFound, { code: 'error', message: 'not found' }) : json(response, STATUS.ok, invoice);
+    }
+    if (request.method === 'DELETE') {
+      return deleteInvoice(accountName, id) ? json(response, STATUS.ok, {}) : json(response, STATUS.notFound, { code: 'error', message: 'not found' });
     }
   }
   if (url.pathname === '/webhooks.json' && request.method === 'GET') {
@@ -242,7 +369,7 @@ const inspect = async (request, response) => {
     return json(response, STATUS.ok, { paused: state.paused });
   }
   if (url.pathname === '/fail' && request.method === 'POST') {
-    state.failures.push({ method: input.method, path: input.path, status: input.status, count: input.count ?? 1 });
+    state.failures.push({ method: input.method, path: input.path, status: input.status, count: input.count ?? 1, body: input.body, drop: Boolean(input.drop) });
     return json(response, STATUS.ok, { failures: state.failures });
   }
   if ((match = url.pathname.match(/^\/ui\/([a-z0-9-]+)\/clients$/)) && request.method === 'POST') {
@@ -257,6 +384,19 @@ const inspect = async (request, response) => {
     }
     if (request.method === 'DELETE') {
       return json(response, deleteClient(match[1], Number(match[2])) ? STATUS.ok : STATUS.notFound, {});
+    }
+  }
+  if ((match = url.pathname.match(/^\/ui\/([a-z0-9-]+)\/invoices$/)) && request.method === 'POST') {
+    const { invoice, error } = createInvoice(match[1], input);
+    return error ? json(response, STATUS.unprocessable, error) : json(response, STATUS.created, invoice);
+  }
+  if ((match = url.pathname.match(/^\/ui\/([a-z0-9-]+)\/invoices\/(\d+)$/))) {
+    if (request.method === 'PATCH') {
+      const { invoice, missing } = updateInvoice(match[1], Number(match[2]), input);
+      return missing ? json(response, STATUS.notFound, {}) : json(response, STATUS.ok, invoice);
+    }
+    if (request.method === 'DELETE') {
+      return json(response, deleteInvoice(match[1], Number(match[2])) ? STATUS.ok : STATUS.notFound, {});
     }
   }
   return json(response, STATUS.notFound, {});

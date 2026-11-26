@@ -6,7 +6,8 @@
 //!   the clients Fakturownia webhooks announce ([`sync`], [`webhook`]).
 //! - `webhook-receiver`: checks and keeps Fakturownia webhook requests
 //!   ([`webhook`]).
-//! - `deferrable-operations`: the scheduled `pull` safety net ([`pull`]).
+//! - `deferrable-operations`: the scheduled `pull` safety net ([`pull`]),
+//!   and the `issue-invoices` record action ([`invoices`]).
 
 wit_bindgen::generate!({
     path: "wit",
@@ -14,6 +15,7 @@ wit_bindgen::generate!({
 });
 
 mod host;
+mod invoices;
 mod pull;
 mod sync;
 mod webhook;
@@ -71,7 +73,10 @@ impl exports::attricat::host::command_handler::Guest for Extension {
 
 impl exports::attricat::host::deferrable_operations::Guest for Extension {
     fn prepare(request: OperationRequest) -> Result<String, String> {
-        pull::prepare(&request)
+        match request.operation_id.as_str() {
+            invoices::OPERATION => invoices::prepare(&request),
+            _ => pull::prepare(&request),
+        }
     }
 
     fn start(_request: OperationRequest) -> Result<String, String> {
@@ -81,6 +86,7 @@ impl exports::attricat::host::deferrable_operations::Guest for Extension {
     fn process_batch(request: OperationRequest) -> Result<BatchOutcome, Failure> {
         match request.operation_id.as_str() {
             pull::OPERATION => pull::process_batch(&request),
+            invoices::OPERATION => invoices::process_batch(&request),
             other => Err(Failure::Fault(format!("unknown operation {other}"))),
         }
     }

@@ -177,7 +177,7 @@ await api('POST', `/extensions/${extensionId}/enable`);
 step('create a webhook endpoint and register it in Fakturownia');
 const endpoint = await api('POST', `/extensions/${extensionId}/webhook-endpoints`, { webhook: 'fakturownia', endpoint: 'main' });
 assert(endpoint.url, 'set EXTENSION_WEBHOOK_BASE_URL so endpoints have a full URL');
-for (const kind of ['client:create', 'client:update', 'client:delete']) {
+for (const kind of ['client:create', 'client:update', 'client:delete', 'invoice:create', 'invoice:update', 'invoice:delete']) {
   const registered = await fakturownia('POST', '/webhooks.json', { webhook: { kind, url: endpoint.url } });
   assert.equal(registered.status, 201);
 }
@@ -297,6 +297,250 @@ const rejected = await waitFor('the rejection', async () => {
   return current?.status === 'rejected' ? current : undefined;
 });
 console.log(`  rejected: ${JSON.stringify(rejected.error ?? rejected.last_error)}`);
+
+// ---- invoices -------------------------------------------------------------------
+
+step('create order, line, product, unit and single-line document blueprints');
+const publish = async (definition) => {
+  const { blueprint: created } = await api('POST', '/blueprints', { definition });
+  await api('POST', `/blueprints/${created.id}/versions/${created.version}/publish`);
+  for (const attribute of (await api('GET', `/blueprints/${created.id}/versions/${created.version}`)).attributes) {
+    attributes[attribute.id] = attribute.code;
+  }
+  return created;
+};
+const codes = {
+  unit: `fk_unit_${suffix}`,
+  product: `fk_product_${suffix}`,
+  order: `fk_order_${suffix}`,
+  line: `fk_order_line_${suffix}`,
+  issue: `fk_issue_${suffix}`,
+};
+const writeBackAttributes = `  - {code: invoice_number, value_type: string}
+  - {code: invoice_status, value_type: string}
+  - {code: invoice_url, value_type: string}
+  - {code: ksef_number, value_type: string}
+  - {code: ksef_status, value_type: string}
+  - {code: invoice_pdf, value_type: file}
+`;
+const recordBlueprint = (code, name, attributes) => `format_version: 1
+code: ${code}
+name: ${name} ${suffix}
+kind: record
+views:
+  dropdown_option: {type: dropdown_option, fields: [${attributes.match(/code: (\w+)/)[1]}]}
+attributes:
+${attributes}`;
+await publish(recordBlueprint(codes.unit, 'Unit', `  - {code: code, value_type: string}\n`));
+await publish(recordBlueprint(codes.product, 'Product', `  - {code: name, value_type: string}
+  - {code: code, value_type: string}
+  - {code: base_unit, value_type: relationship, target_blueprint: ${codes.unit}}
+`));
+const orderBlueprint = await publish(recordBlueprint(codes.order, 'Sales order', `  - {code: number, value_type: string}
+  - {code: customer, value_type: relationship, target_blueprint: ${blueprintCode}}
+  - {code: document_date, value_type: date}
+  - {code: note, value_type: string}
+${writeBackAttributes}`));
+await publish(recordBlueprint(codes.line, 'Sales order line', `  - {code: title, value_type: string}
+  - {code: sales_order, value_type: relationship, target_blueprint: ${codes.order}}
+  - {code: item, value_type: relationship, target_blueprint: ${codes.product}}
+  - {code: quantity, value_type: number}
+  - {code: unit_price_net, value_type: number}
+`));
+const issueBlueprint = await publish(recordBlueprint(codes.issue, 'Goods issue', `  - {code: number, value_type: string}
+  - {code: customer, value_type: relationship, target_blueprint: ${blueprintCode}}
+  - {code: item_name, value_type: string}
+  - {code: quantity, value_type: number}
+  - {code: price, value_type: number}
+${writeBackAttributes}`));
+
+const orderInvoices = (extra = {}) => ({
+  source: { blueprint: codes.order, context: 'default' },
+  buyer: 'customer',
+  header: { kind: 'vat', issue_date: null, sell_date: 'document_date', oid: 'number', description: 'note',
+    payment_to_days: 14, payment_type: 'transfer', currency: 'PLN' },
+  positions: {
+    lines: { blueprint: codes.line, parent: 'sales_order' },
+    name: 'item.name', code: 'item.code', quantity: 'quantity', unit: 'item.base_unit.code',
+    price_net: 'unit_price_net', tax: { default: '23' },
+  },
+  write_back: { number: 'invoice_number', status: 'invoice_status', url: 'invoice_url',
+    ksef_number: 'ksef_number', ksef_status: 'ksef_status', file: 'invoice_pdf' },
+  link_existing_by_oid: false,
+  ...extra,
+});
+const configureInvoices = async (invoices) => {
+  const body = configuration(blueprintCode);
+  body.configuration.invoices = invoices;
+  await api('PUT', `/extensions/${extensionId}/configure`, body);
+};
+await configureInvoices(orderInvoices());
+
+step('a pull records the invoice watermark');
+assert.equal((await pull('invoice-baseline')).status, 'completed');
+
+const releaseId = (await api('GET', '/extensions')).find((item) => item.extension_id === extensionId).installed_release_id;
+const issueInvoices = async (blueprint, recordIds, key) => {
+  const started = await api('POST', `/extensions/${extensionId}/issue-invoices/operations`, {
+    release_id: releaseId,
+    operation_id: 'issue-invoices',
+    input: {},
+    idempotency_key: `${key}-${suffix}`,
+    selection: { blueprint_id: blueprint.id, blueprint_version: blueprint.version, context_id: null, record_ids: recordIds },
+  });
+  return waitFor(`issue ${key}`, async () => {
+    const current = await api('GET', `/extension-operation-runs/${started.run_id}`);
+    return ['completed', 'dead_letter', 'cancelled', 'failed'].includes(current.status) ? current : undefined;
+  });
+};
+const results = (run) => run.progress?.results ?? [];
+const invoicesIn = async () => Object.values((await mock('GET', '/state')).accounts[account]?.invoices ?? {});
+const invoiceCreates = async () => (await mock('GET', '/requests')).filter((request) => request.method === 'POST' && request.path === '/invoices.json');
+const order = async (number, lines, extra = []) => {
+  const id = (await api('POST', '/v1/records', {
+    blueprint: { code: codes.order },
+    values: [scalar('number', number), scalar('document_date', '2026-11-20'), scalar('note', `Order ${number}`), ...extra,
+      { kind: 'relationship', attribute_code: 'customer', context_id: context.id, target_record_id: acme }],
+  })).id;
+  for (const [index, line] of lines.entries()) {
+    const values = [scalar('title', `${number} line ${index + 1}`), scalar('quantity', line.quantity),
+      { kind: 'relationship', attribute_code: 'sales_order', context_id: context.id, target_record_id: id },
+      { kind: 'relationship', attribute_code: 'item', context_id: context.id, target_record_id: line.item }];
+    if (line.price !== undefined) values.push(scalar('unit_price_net', line.price));
+    await api('POST', '/v1/records', { blueprint: { code: codes.line }, values });
+  }
+  return id;
+};
+
+const piece = (await api('POST', '/v1/records', { blueprint: { code: codes.unit }, values: [scalar('code', 'szt')] })).id;
+const widget = (await api('POST', '/v1/records', { blueprint: { code: codes.product }, values: [scalar('name', 'Widget'), scalar('code', 'W-1'),
+  { kind: 'relationship', attribute_code: 'base_unit', context_id: context.id, target_record_id: piece }] })).id;
+const gadget = (await api('POST', '/v1/records', { blueprint: { code: codes.product }, values: [scalar('name', 'Gadget'), scalar('code', 'G-2'),
+  { kind: 'relationship', attribute_code: 'base_unit', context_id: context.id, target_record_id: piece }] })).id;
+
+step('an order with two lines is invoiced from the record action');
+const number1 = `ZS/1/${suffix}`;
+const order1 = await order(number1, [{ item: widget, quantity: 2, price: 10.5 }, { item: gadget, quantity: 1, price: 99 }]);
+const issued = await issueInvoices(orderBlueprint, [order1], 'issue-1');
+assert.equal(issued.status, 'completed', JSON.stringify(issued));
+assert.equal(results(issued)[0]?.outcome, 'succeeded', JSON.stringify(issued.progress));
+const [created1] = (await invoiceCreates()).map((request) => request.body.invoice);
+assert.equal(created1.client_id, remote.id, 'the buyer is the mapped Fakturownia client');
+assert.equal(created1.oid, number1);
+assert.equal(created1.sell_date, '2026-11-20');
+assert.equal(created1.description, `Order ${number1}`);
+assert.equal(created1.payment_to_kind, '14');
+assert.equal(created1.exclude_from_stock_level, true);
+assert.deepEqual(created1.positions, [
+  { name: 'Widget', code: 'W-1', quantity: '2', quantity_unit: 'szt', price_net: '10.5', tax: '23' },
+  { name: 'Gadget', code: 'G-2', quantity: '1', quantity_unit: 'szt', price_net: '99', tax: '23' },
+]);
+assert(created1.positions.every((position) => !('product_id' in position)), 'no Fakturownia product, so no stock moves');
+const invoice1 = (await invoicesIn()).find((invoice) => invoice.oid === number1);
+let written = await values(order1);
+assert.equal(written.invoice_number, invoice1.number);
+assert.equal(written.invoice_status, 'issued');
+assert.equal(written.invoice_url, `https://${account}.fakturownia.pl/invoice/${invoice1.token}`);
+assert.equal((await mapping(order1)).external_id, `invoice:${invoice1.id}`);
+const pdf = (await api('GET', `/records/${order1}/resolved-preview?context_id=${context.id}`)).values.invoice_pdf?.value?.[0];
+assert.equal(pdf?.filename, `${invoice1.number.replaceAll('/', '-')}.pdf`, JSON.stringify(pdf));
+assert.equal(pdf.mime_type, 'application/pdf');
+assert((await mock('GET', '/requests')).some((request) => request.path === `/invoices/${invoice1.id}.pdf` && request.bearer));
+console.log(`  order ${order1} -> invoice ${invoice1.number}`);
+
+step('a second action on the same order is refused');
+const again = await issueInvoices(orderBlueprint, [order1], 'issue-1-again');
+assert.equal(results(again)[0]?.outcome, 'failed');
+assert.match(results(again)[0].message, /already invoiced as/);
+assert.equal((await invoicesIn()).filter((invoice) => invoice.oid === number1).length, 1);
+
+step('a create whose answer is lost is retried without a second invoice');
+const number2 = `ZS/2/${suffix}`;
+const order2 = await order(number2, [{ item: widget, quantity: 3, price: 5 }]);
+await mock('POST', '/fail', { method: 'POST', path: '/invoices.json', drop: true, count: 1 });
+const lost = await issueInvoices(orderBlueprint, [order2], 'issue-2');
+assert.equal(results(lost)[0]?.outcome, 'succeeded', JSON.stringify(lost.progress));
+assert.equal((await invoicesIn()).filter((invoice) => invoice.oid === number2).length, 1, 'one invoice despite the lost answer');
+const invoice2 = (await invoicesIn()).find((invoice) => invoice.oid === number2);
+assert.equal((await values(order2)).invoice_number, invoice2.number);
+
+step('a line without a price is rejected before anything is sent');
+const creates = (await invoiceCreates()).length;
+const number3 = `ZS/3/${suffix}`;
+const order3 = await order(number3, [{ item: widget, quantity: 1 }]);
+const incomplete = await issueInvoices(orderBlueprint, [order3], 'issue-3');
+assert.equal(results(incomplete)[0]?.outcome, 'failed');
+assert.match(results(incomplete)[0].message, /line 1 \(.*\): price_net is empty/);
+assert.equal((await invoiceCreates()).length, creates, 'nothing was sent');
+const rejected3 = await mapping(order3);
+assert.equal(rejected3.status, 'rejected');
+assert.match(JSON.stringify(rejected3.error), /price_net is empty/);
+
+step('a Fakturownia validation error rejects the order');
+const number4 = `ZS/4/${suffix}`;
+const order4 = await order(number4, [{ item: gadget, quantity: 1, price: 1 }]);
+await mock('POST', '/fail', { method: 'POST', path: '/invoices.json', status: 422, count: 1,
+  body: { code: 'error', message: { buyer_tax_no: ['- jest nieprawidłowy'] } } });
+const invalid = await issueInvoices(orderBlueprint, [order4], 'issue-4');
+assert.equal(results(invalid)[0]?.outcome, 'failed');
+assert.equal(results(invalid)[0].message, 'buyer_tax_no: jest nieprawidłowy');
+assert.equal((await mapping(order4)).status, 'rejected');
+
+step('payment and the KSeF number arrive through the webhook');
+await mock('PATCH', `/ui/${account}/invoices/${invoice1.id}`, { status: 'paid', gov_id: '5250001009-20261126-0A1B2C3D4E5F-01', gov_status: 'ok' });
+written = await waitFor('the paid invoice in Attricat', async () => {
+  const current = await values(order1);
+  return current.invoice_status === 'paid' ? current : undefined;
+});
+assert.equal(written.ksef_number, '5250001009-20261126-0A1B2C3D4E5F-01');
+assert.equal(written.ksef_status, 'ok');
+
+step('a lost invoice webhook is caught up by the pull operation');
+await mock('POST', '/webhooks/pause', { paused: true });
+await mock('PATCH', `/ui/${account}/invoices/${invoice2.id}`, { status: 'sent' });
+await sleep(3000);
+assert.equal((await values(order2)).invoice_status, 'issued');
+assert.equal((await pull('invoice-catch-up')).status, 'completed');
+assert.equal((await values(order2)).invoice_status, 'sent');
+await mock('POST', '/webhooks/pause', { paused: false });
+
+step('a deleted invoice clears the order, which can then be invoiced again');
+await mock('DELETE', `/ui/${account}/invoices/${invoice2.id}`);
+await waitFor('the cleared order', async () => !('invoice_number' in (await values(order2))));
+assert.equal(await mapping(order2), undefined, 'the mapping is gone');
+const reissued = await issueInvoices(orderBlueprint, [order2], 'issue-2-again');
+assert.equal(results(reissued)[0]?.outcome, 'succeeded', JSON.stringify(reissued.progress));
+const invoice2b = (await invoicesIn()).find((invoice) => invoice.oid === number2);
+assert.notEqual(invoice2b.id, invoice2.id);
+assert.equal((await values(order2)).invoice_number, invoice2b.number);
+
+step('an invoice made in Fakturownia is linked to its order by number');
+await configureInvoices(orderInvoices({ link_existing_by_oid: true }));
+const number5 = `ZS/5/${suffix}`;
+const order5 = await order(number5, [{ item: widget, quantity: 1, price: 1 }]);
+const { id: manualId } = await mock('POST', `/ui/${account}/invoices`, { oid: number5, client_id: remote.id,
+  positions: [{ name: 'Typed by hand', quantity: 1, price_net: 1, tax: '23' }] });
+await waitFor('the linked order', async () => (await mapping(order5))?.external_id === `invoice:${manualId}`);
+assert.equal((await values(order5)).invoice_status, 'issued');
+
+step('a single-line goods issue is invoiced from the record itself');
+await configureInvoices({
+  source: { blueprint: codes.issue },
+  buyer: 'customer',
+  header: { oid: 'number' },
+  positions: { name: 'item_name', quantity: 'quantity', price_net: 'price', tax: { default: '8' } },
+  write_back: { number: 'invoice_number', status: 'invoice_status' },
+});
+const number6 = `WZ/6/${suffix}`;
+const goodsIssue = (await api('POST', '/v1/records', { blueprint: { code: codes.issue }, values: [scalar('number', number6),
+  scalar('item_name', 'Pallet'), scalar('quantity', 4), scalar('price', 12),
+  { kind: 'relationship', attribute_code: 'customer', context_id: context.id, target_record_id: acme }] })).id;
+const single = await issueInvoices(issueBlueprint, [goodsIssue], 'issue-6');
+assert.equal(results(single)[0]?.outcome, 'succeeded', JSON.stringify(single.progress));
+const created6 = (await invoiceCreates()).map((request) => request.body.invoice).find((invoice) => invoice.oid === number6);
+assert.deepEqual(created6.positions, [{ name: 'Pallet', quantity: '4', price_net: '12', tax: '8' }]);
+assert.equal((await values(goodsIssue)).invoice_number, (await invoicesIn()).find((invoice) => invoice.oid === number6).number);
+await configureInvoices(orderInvoices());
 
 step('a webhook with a wrong token is refused and kept nowhere');
 const forged = await fetch(endpoint.url, {

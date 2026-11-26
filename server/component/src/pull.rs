@@ -1,9 +1,10 @@
 //! The `pull` operation: the safety net for webhooks that never arrived.
 //!
-//! Fakturownia has no "changed since" filter, so the operation pages clients
-//! by `updated_at` descending and stops at the watermark the previous run
-//! stored. The first run only sets the watermark; linking existing clients is
-//! a separate step.
+//! Fakturownia has no "changed since" filter, so the operation pages clients,
+//! then invoices when they are configured, by `updated_at` descending and
+//! stops at the watermark each kind's previous run stored. The first run only
+//! sets the watermarks; linking existing clients is a separate step. Deleted
+//! invoices are not listed, so only their webhook clears them.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -14,17 +15,47 @@ use crate::attricat::host::clock;
 use crate::attricat::host::outcomes::{Failure, Retry};
 use crate::exports::attricat::host::deferrable_operations::{BatchOutcome, OperationRequest};
 use crate::host::{self, Http, Mode, decode, encode};
-use crate::sync;
+use crate::{invoices, sync};
 
 pub const OPERATION: &str = "pull";
-const WATERMARK_KEY: &str = "pull.clients.watermark";
-/// Clients per page; Fakturownia allows at most 100.
+/// Objects per page; Fakturownia allows at most 100.
 const PAGE_SIZE: usize = 25;
 const STATUS_OK: u16 = 200;
 const RETRY_AFTER_MS: u64 = 5_000;
 
+/// What a pull pages, in order.
+#[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum Phase {
+    #[default]
+    Clients,
+    Invoices,
+}
+
+impl Phase {
+    fn watermark_key(self) -> &'static str {
+        match self {
+            Phase::Clients => "pull.clients.watermark",
+            Phase::Invoices => "pull.invoices.watermark",
+        }
+    }
+
+    fn list_path(self, page: u32) -> String {
+        match self {
+            Phase::Clients => {
+                format!("/clients.json?order=updated_at.desc&page={page}&per_page={PAGE_SIZE}")
+            }
+            Phase::Invoices => format!(
+                "/invoices.json?period=all&order=updated_at.desc&page={page}&per_page={PAGE_SIZE}"
+            ),
+        }
+    }
+}
+
 #[derive(Default, Deserialize, Serialize)]
 struct Checkpoint {
+    #[serde(default)]
+    phase: Phase,
     page: u32,
     /// The newest `updated_at` seen in this run, in epoch milliseconds.
     newest: Option<i64>,
@@ -56,6 +87,9 @@ pub fn prepare(request: &OperationRequest) -> Result<String, String> {
     };
     sync::blueprint(&config, &mode).map_err(missing)?;
     sync::context_id(&config, &mode).map_err(missing)?;
+    if invoices::section(&config).is_some() {
+        invoices::validated(&config, &mode).map_err(missing)?;
+    }
     Ok("prepared".into())
 }
 
@@ -66,13 +100,16 @@ pub fn process_batch(request: &OperationRequest) -> Result<BatchOutcome, Failure
     } else {
         decode(&request.checkpoint, "checkpoint").unwrap_or_default()
     };
-    let watermark = host::storage_get(WATERMARK_KEY)?.and_then(|value| value.as_i64());
+    let phase = checkpoint.phase;
+    let mode = Mode::Run {
+        batch_key: &request.batch_key,
+    };
+    let watermark = host::storage_get(phase.watermark_key())?.and_then(|value| value.as_i64());
     let page = checkpoint.page + 1;
-    let path = format!("/clients.json?order=updated_at.desc&page={page}&per_page={PAGE_SIZE}");
-    let clients = match host::fakturownia(&config, "GET", &path, None)? {
+    let objects = match host::fakturownia(&config, "GET", &phase.list_path(page), None)? {
         Http::Response { status, body } if status == STATUS_OK => {
-            let clients: Value = decode(&body, "client list")?;
-            clients.as_array().cloned().unwrap_or_default()
+            let objects: Value = decode(&body, "list")?;
+            objects.as_array().cloned().unwrap_or_default()
         }
         Http::Response { status, .. } => {
             return Err(retry(
@@ -83,9 +120,9 @@ pub fn process_batch(request: &OperationRequest) -> Result<BatchOutcome, Failure
         Http::RateLimited(after_ms) => return Err(retry("request budget spent", after_ms)),
         _ => return Err(retry("Fakturownia did not answer", RETRY_AFTER_MS)),
     };
-    let mut reached_watermark = clients.len() < PAGE_SIZE;
-    for client in &clients {
-        let Some(object) = client.as_object() else {
+    let mut reached_watermark = objects.len() < PAGE_SIZE;
+    for object in &objects {
+        let Some(object) = object.as_object() else {
             continue;
         };
         let updated = object
@@ -100,38 +137,42 @@ pub fn process_batch(request: &OperationRequest) -> Result<BatchOutcome, Failure
                 break;
             }
             _ => {
-                let applied = sync::apply_client(
-                    &config,
-                    object,
-                    &Mode::Run {
-                        batch_key: &request.batch_key,
-                    },
-                )
-                .inspect_err(|failure| {
-                    host::log(
-                        "warn",
-                        &format!("pull could not apply a client: {failure:?}"),
-                    );
-                })?;
-                if applied != sync::Applied::Unchanged {
+                let changed = match phase {
+                    Phase::Clients => {
+                        sync::apply_client(&config, object, &mode)? != sync::Applied::Unchanged
+                    }
+                    Phase::Invoices => matches!(
+                        invoices::apply_invoice(&config, object, &mode)?,
+                        invoices::Applied::Updated | invoices::Applied::Linked
+                    ),
+                };
+                if changed {
                     checkpoint.applied += 1;
                 }
             }
         }
     }
     checkpoint.page = page;
+    let mut done = false;
     if reached_watermark {
         // A first run over an empty account still starts the watermark.
         let now = clock::now().seconds as i64 * 1_000;
         let newest = checkpoint.newest.max(watermark).unwrap_or(now);
-        host::storage_set(WATERMARK_KEY, &json!(newest))?;
+        host::storage_set(phase.watermark_key(), &json!(newest))?;
+        if phase == Phase::Clients && invoices::section(&config).is_some() {
+            checkpoint.phase = Phase::Invoices;
+            checkpoint.page = 0;
+            checkpoint.newest = None;
+        } else {
+            done = true;
+        }
     }
-    let progress = json!({"pages": checkpoint.page, "applied": checkpoint.applied,
-        "baseline": watermark.is_none()});
+    let progress = json!({"phase": checkpoint.phase, "pages": checkpoint.page,
+        "applied": checkpoint.applied, "baseline": watermark.is_none()});
     Ok(BatchOutcome {
         checkpoint: encode(&checkpoint)?,
         progress: progress.to_string(),
-        done: reached_watermark,
+        done,
         resume_after_ms: None,
     })
 }

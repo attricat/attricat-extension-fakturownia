@@ -12,6 +12,8 @@
 //!   projection. If nothing changes, the change was the echo of our own push or
 //!   touched only unmapped fields, so nothing is written.
 
+pub mod invoices;
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -86,7 +88,16 @@ pub struct ClientSync {
 /// The context used when configuration names none.
 pub const DEFAULT_CONTEXT: &str = "default";
 
-fn default_context() -> String {
+/// Whether `text` is an Attricat code: a lowercase letter, then lowercase
+/// letters, digits or underscores.
+pub fn is_code(text: &str) -> bool {
+    let mut bytes = text.bytes();
+    bytes.next().is_some_and(|byte| byte.is_ascii_lowercase())
+        && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        && text.len() <= 64
+}
+
+pub(crate) fn default_context() -> String {
     DEFAULT_CONTEXT.to_owned()
 }
 
@@ -102,6 +113,9 @@ pub struct Config {
     #[serde(default = "default_true")]
     pub verify_webhook_token: bool,
     pub clients: ClientSync,
+    /// Invoices issued from Attricat records; optional.
+    #[serde(default)]
+    pub invoices: Option<invoices::InvoiceSync>,
 }
 
 fn default_true() -> bool {
@@ -131,6 +145,9 @@ impl Config {
         }
         if self.clients.fields.is_empty() {
             return Err("clients.fields maps no field".into());
+        }
+        if let Some(invoices) = &self.invoices {
+            invoices.validate(&self.clients.blueprint)?;
         }
         let mut seen = std::collections::BTreeSet::new();
         for mapping in &self.clients.fields {

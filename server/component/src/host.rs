@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 use attricat_fakturownia_sync_core::Config;
 
 use crate::attricat::host::api;
-use crate::attricat::host::attricat_data;
+use crate::attricat::host::{attricat_data, selection, transfer};
 
 /// The `source-name` of events caused by this extension's own writes.
 pub const OWN_SOURCE: &str = "extension:attricat-fakturownia";
@@ -95,10 +95,23 @@ impl Mode<'_> {
     }
 }
 
-/// The configured blueprint's current published revision.
+/// A blueprint's current published revision.
 pub struct Blueprint {
     pub id: String,
     pub version: i64,
+    /// The `blueprint` read as the host answered it, with its attributes.
+    pub read: Value,
+}
+
+impl Blueprint {
+    /// The ID of the attribute with `code` in this revision.
+    pub fn attribute_id(&self, code: &str) -> Option<&str> {
+        self.read["attributes"]
+            .as_array()?
+            .iter()
+            .find(|attribute| attribute["code"] == code)?["id"]
+            .as_str()
+    }
 }
 
 /// The current revision of the blueprint with `code`, or `None`.
@@ -110,10 +123,48 @@ pub fn blueprint(mode: &Mode, code: &str) -> Result<Option<Blueprint>, String> {
             (Some(id), Some(version)) => Some(Blueprint {
                 id: id.to_owned(),
                 version,
+                read: found.clone(),
             }),
             _ => None,
         },
     )
+}
+
+/// The record of `blueprint` whose `attribute` is `value`: `Ok(None)` when
+/// none is, an error when several are.
+pub fn lookup(
+    mode: &Mode,
+    blueprint: &Blueprint,
+    attribute_id: &str,
+    value: &str,
+) -> Result<Option<String>, String> {
+    let found = mode.read(&json!({"operation": "lookup", "blueprint_id": blueprint.id,
+        "blueprint_version": blueprint.version, "attribute_id": attribute_id, "value": value}))?;
+    Ok(found["id"].as_str().map(str::to_owned))
+}
+
+/// Records per `incoming` page, the host's maximum.
+const INCOMING_PAGE: u32 = 100;
+
+/// One page of the records of `source_blueprint` whose `field` points at
+/// `record_id`: their IDs and the next cursor.
+pub fn incoming(
+    mode: &Mode,
+    record_id: &str,
+    source_blueprint: &str,
+    field: &str,
+    cursor: Option<&str>,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let page = mode.read(&json!({"operation": "incoming", "record_id": record_id,
+        "relationships": [{"source_blueprint": source_blueprint, "field": field}],
+        "cursor": cursor, "limit": INCOMING_PAGE}))?;
+    let ids = page["items"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect();
+    Ok((ids, page["next_cursor"].as_str().map(str::to_owned)))
 }
 
 /// The ID of the context with `code`, or `None`.
@@ -130,6 +181,15 @@ pub struct Record {
     /// Values resolved in the requested context, keyed by attribute code;
     /// empty when no context was requested.
     pub values: Map<String, Value>,
+    /// Relationship targets by attribute code, in order.
+    pub relationships: Map<String, Value>,
+}
+
+impl Record {
+    /// The first record a relationship points at.
+    pub fn target(&self, code: &str) -> Option<&str> {
+        self.relationships.get(code)?.as_array()?.first()?.as_str()
+    }
 }
 
 /// One record, with its values resolved in `context_id` when one is given.
@@ -142,7 +202,7 @@ pub fn read_record(
         "context_id": context_id}))?;
     let record = &read["record"];
     // `values` maps each code to `{value, source_context}`.
-    let values = read["resolved_values"]["values"]
+    let values: Map<String, Value> = read["resolved_values"]["values"]
         .as_object()
         .map(|values| {
             values
@@ -151,7 +211,55 @@ pub fn read_record(
                 .collect()
         })
         .unwrap_or_default();
+    // Relationship targets are direct values, in the requested context or
+    // in any context when it has none; the read resolves no relationships.
+    let codes: Map<String, Value> = read["blueprint"]["attributes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|attribute| {
+            Some((
+                attribute["id"].as_str()?.to_owned(),
+                attribute["code"].clone(),
+            ))
+        })
+        .collect();
+    let mut relationships: Map<String, Value> = Map::new();
+    let direct = read["direct_values"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut in_requested = Vec::new();
+    for in_context in [true, false] {
+        if !in_context {
+            in_requested = relationships.keys().cloned().collect();
+        }
+        for value in &direct {
+            let (Some(target), Some(code)) = (
+                value["relationship_target_record_id"].as_str(),
+                value["attribute_id"]
+                    .as_str()
+                    .and_then(|id| codes.get(id))
+                    .and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            if value["active"] == false
+                || (in_context && value["context_id"].as_str() != context_id)
+                || (!in_context && in_requested.iter().any(|known| known == code))
+            {
+                continue;
+            }
+            if let Value::Array(targets) = relationships
+                .entry(code.to_owned())
+                .or_insert_with(|| Value::Array(Vec::new()))
+            {
+                targets.push(json!(target));
+            }
+        }
+    }
     Ok(Record {
+        relationships,
         blueprint: read["blueprint"]["blueprint"]["code"]
             .as_str()
             .unwrap_or_default()
@@ -219,11 +327,81 @@ pub fn commit(record_id: &str, fields: Value) -> Result<(), String> {
     Ok(())
 }
 
+pub fn delete_mapping(record_id: &str) -> Result<(), String> {
+    call("mappings.delete.v1", &json!({"record_id": record_id}))?;
+    Ok(())
+}
+
 pub fn release(record_id: &str, lease_token: &str) {
     let _ = call(
         "mappings.release.v1",
         &json!({"record_id": record_id, "lease_token": lease_token}),
     );
+}
+
+// ---------------------------------------------------------------- runs
+
+/// One member of an interactive run's selection and the cursor after it.
+pub fn selection_member(cursor: &str) -> Result<(Option<Value>, Option<String>), String> {
+    let page: Value = decode(&selection::page(cursor, 1)?, "selection page")?;
+    Ok((
+        page["records"]
+            .as_array()
+            .and_then(|records| records.first())
+            .cloned(),
+        page["next_cursor"].as_str().map(str::to_owned),
+    ))
+}
+
+/// The number of records in an interactive run's selection.
+pub fn selection_count() -> Result<u64, String> {
+    let described: Value = decode(&selection::describe()?, "selection")?;
+    Ok(described["count"].as_u64().unwrap_or_default())
+}
+
+/// The largest document fetched into a run, the host's range maximum.
+const MAX_FETCH_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Downloads `path_and_query` from the account into an input artifact of the
+/// run, with the API token as a host-substituted Bearer header, and returns
+/// the artifact's ID. A retried batch gets the same artifact back.
+pub fn fetch_document(
+    config: &Config,
+    path_and_query: &str,
+    transfer_key: &str,
+) -> Result<String, String> {
+    let request = json!({
+        "host_permission_id": API_PERMISSION,
+        "url": format!("{}{path_and_query}", config.base_url()),
+        "transfer_key": transfer_key,
+        "offset": 0,
+        "max_bytes": MAX_FETCH_BYTES,
+        "secret_headers": [{"secret": config.token_secret(), "header": "authorization",
+            "prefix": "Bearer "}],
+    });
+    let fetched: Value = decode(
+        &transfer::fetch_input_v2(&request.to_string())?,
+        "fetched input",
+    )?;
+    fetched["artifact_id"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| format!("the document was not fetched: {fetched}"))
+}
+
+/// Attaches an input artifact of the run to a record's file attribute.
+pub fn attach_file(
+    record_id: &str,
+    attribute: &str,
+    context_id: &str,
+    artifact_id: &str,
+    filename: &str,
+) -> Result<Value, String> {
+    call(
+        "files.attach.v1",
+        &json!({"record_id": record_id, "attribute_code": attribute, "context_id": context_id,
+            "artifact_id": artifact_id, "filename": filename}),
+    )
 }
 
 // ---------------------------------------------------------------- storage
