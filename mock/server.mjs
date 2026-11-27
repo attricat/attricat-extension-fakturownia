@@ -111,10 +111,17 @@ const pick = (input = {}) =>
 /** The kinds a webhook can be registered for; `invoice:destroy` is ASSUMED. */
 const WEBHOOK_KINDS = new Set(['client:create', 'client:update', 'client:destroy', 'invoice:create', 'invoice:update', 'invoice:destroy']);
 
-/** The documented delivery body: the object under its key, no event kind. */
-const deliveryBody = (resource, object) => (resource === 'invoice'
-  ? { id: object.id, deal: object, app_name: 'fakturownia', api_token: '', locale: 'pl' }
-  : { [resource]: object, app_name: 'fakturownia', api_token: '', locale: 'pl' });
+/**
+ * The documented delivery body: the object under its key, no event kind. A
+ * real account's objects carry no timestamps, so neither do these: two
+ * updates of one object differ only in their fields.
+ */
+const deliveryBody = (resource, input) => {
+  const { created_at: _created, updated_at: _updated, ...object } = input;
+  return resource === 'invoice'
+    ? { id: object.id, deal: object, app_name: 'fakturownia', api_token: '', locale: 'pl' }
+    : { [resource]: object, app_name: 'fakturownia', api_token: '', locale: 'pl' };
+};
 
 /** Sends `kind` to every matching webhook of the account, fire and forget. */
 const fire = (accountName, kind, object) => {

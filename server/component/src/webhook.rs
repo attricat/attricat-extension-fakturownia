@@ -70,9 +70,14 @@ pub fn receive(request: WebhookRequest) -> Result<WebhookOutcome, String> {
         "id": announcement.id,
     });
     let mut outcome = reply(STATUS_OK, "accepted");
+    // No dedupe key: Fakturownia's objects carry no timestamp, and an object
+    // that returns to an earlier state (paid, partial, paid again) would
+    // repeat any key built from it. A repeat is harmless, since the handler
+    // fetches the current object and writes only what differs, and rare,
+    // since Fakturownia retries only answers other than 2xx.
     outcome.keep = Some(KeptPayload {
         payload: kept.to_string(),
-        dedupe_key: Some(announcement.dedupe_key()),
+        dedupe_key: None,
     });
     Ok(outcome)
 }

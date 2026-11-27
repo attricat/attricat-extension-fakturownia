@@ -287,20 +287,6 @@ pub struct Announcement {
     /// does not say which event fired.
     pub action: String,
     pub id: i64,
-    pub updated_at: Option<String>,
-}
-
-impl Announcement {
-    /// The receipt dedupe key: one delivery per object state.
-    pub fn dedupe_key(&self) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            self.resource.name(),
-            self.id,
-            self.action,
-            self.updated_at.as_deref().unwrap_or("-")
-        )
-    }
 }
 
 /// The top-level keys Fakturownia puts the changed object under, and what
@@ -336,10 +322,6 @@ pub fn parse_webhook(body: &str, query: &str) -> Result<Announcement, String> {
         resource,
         action: query_action(query).unwrap_or_else(|| "change".to_owned()),
         id,
-        updated_at: object
-            .get("updated_at")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
     })
 }
 
@@ -542,23 +524,24 @@ mod tests {
 
     #[test]
     fn webhooks_parse_the_documented_format() {
-        let client = json!({"client": {"id": 42, "name": "Acme",
-            "updated_at": "2026-11-25T10:00:00.000+01:00"},
+        // Real deliveries carry no updated_at and name no event.
+        let client = json!({"client": {"id": 42, "name": "Acme"},
             "app_name": "fakturownia", "api_token": "", "locale": "pl"})
         .to_string();
         let announcement = parse_webhook(&client, "").unwrap();
-        assert_eq!(announcement.resource, Resource::Client);
-        assert_eq!(announcement.id, 42);
         assert_eq!(
-            announcement.dedupe_key(),
-            "client:42:change:2026-11-25T10:00:00.000+01:00"
+            (
+                announcement.resource,
+                announcement.id,
+                announcement.action.as_str()
+            ),
+            (Resource::Client, 42, "change")
         );
-        // The registered URL's kind keeps a delete apart from the last update.
         assert_eq!(
             parse_webhook(&client, "kind=client%3Adestroy")
                 .unwrap()
-                .dedupe_key(),
-            "client:42:destroy:2026-11-25T10:00:00.000+01:00"
+                .action,
+            "destroy"
         );
         assert_eq!(
             parse_webhook(&client, "a=1&kind=client:update")

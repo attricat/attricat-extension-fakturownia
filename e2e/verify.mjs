@@ -500,6 +500,12 @@ written = await waitFor('the paid invoice in Attricat', async () => {
 assert.equal(written.ksef_number, '5250001009-20261126-0A1B2C3D4E5F-01');
 assert.equal(written.ksef_status, 'ok');
 
+step('every later change of one invoice arrives too, though its deliveries carry no timestamp');
+for (const status of ['partial', 'paid']) {
+  await mock('PATCH', `/ui/${account}/invoices/${invoice1.id}`, { status });
+  await waitFor(`invoice status ${status} in Attricat`, async () => (await values(order1)).invoice_status === status);
+}
+
 step('a lost invoice webhook is caught up by the pull operation');
 await mock('POST', '/webhooks/pause', { paused: true });
 await mock('PATCH', `/ui/${account}/invoices/${invoice2.id}`, { status: 'sent' });

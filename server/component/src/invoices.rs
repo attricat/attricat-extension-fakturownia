@@ -594,12 +594,19 @@ fn write_back(
     let remote = write_back_projection(&sync.write_back, state);
     let hash = write_back_hash(&remote);
     let writes = write_back_writes(&sync.write_back, &local, &remote);
+    // The record's revision makes the key unique per change: an invoice that
+    // returns to an earlier state (paid, partial, paid again) repeats its
+    // hash, and the host would skip a write whose key it has already seen.
+    // It goes before the hash, which intent_key may cut short.
+    let revision = record
+        .content_revision
+        .map_or_else(|| "-".to_owned(), |revision| revision.to_string());
     let written = apply_writes(
         mode,
         context_id,
         record_id,
         &writes,
-        &["invoice", invoice, &hash],
+        &["invoice", invoice, &revision, &hash],
     )?;
     let revision = if written {
         host::read_record(mode, record_id, None)?.content_revision

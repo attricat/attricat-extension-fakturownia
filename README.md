@@ -155,7 +155,7 @@ The section is validated against the published revisions before any Fakturownia 
 
 1. Store the API token as the workspace extension secret `fakturownia-api-token`.
 2. Create a webhook endpoint (Webhooks section, or `acli extension webhook create attricat-fakturownia --webhook fakturownia --endpoint main`).
-3. In Fakturownia (Ustawienia → Ustawienia konta → Integracja → Webhooki, or `POST /webhooks.json` with `{"webhook": {"kind": "client:update", "url": "..."}}`), register the endpoint's URL for `client:create` and `client:update`, and with invoices also for `invoice:create` and `invoice:update`. Append `?kind=<kind>` to each URL, such as `…?kind=client:update`: Fakturownia's body does not say which event fired, and the kind keeps a delete apart from the update before it. `client:destroy` is accepted too, but a client deleted in Fakturownia is only logged: the extension never deletes Attricat records. Leave the webhook's **Api token** empty; see [Webhooks](#webhooks).
+3. In Fakturownia (Ustawienia → Ustawienia konta → Integracja → Webhooki, or `POST /webhooks.json` with `{"webhook": {"kind": "client:update", "url": "..."}}`), register the endpoint's URL for `client:create` and `client:update`, and with invoices also for `invoice:create` and `invoice:update`. Append `?kind=<kind>` to each URL, such as `…?kind=client:update`: Fakturownia's body does not say which event fired, and the kind is kept with each delivery, so the webhook receipts show it. `client:destroy` is accepted too, but a client deleted in Fakturownia is only logged: the extension never deletes Attricat records. Leave the webhook's **Api token** empty; see [Webhooks](#webhooks).
 4. Schedule `pull` (for example every 30 minutes). Its first run only sets the watermarks, the invoices one included. Attricat 1.9.0 refuses to schedule an operation for an extension whose configuration has a key containing `token` or `secret`, so leave out `token_secret` while its default fits.
 5. With invoices: fill in the account's company details in Fakturownia (Ustawienia → Dane firmy), give the source blueprint the write-back attributes, push the buyers (save each client record once) and, on a warehouse-enabled Fakturownia account, check the warehouse setting described under [Invoices](#invoices).
 
@@ -169,6 +169,12 @@ invoice) or `product`, with `app_name`, `locale` and `api_token`. The body
 names no event. Any answer other than 2xx, a redirect included, is retried,
 and after 25 failures Fakturownia turns the webhook off and emails the account
 owner. `receive` therefore acknowledges with 200 every body it cannot read.
+Deliveries are not deduplicated. The objects carry no `updated_at`, and an
+object can return to an earlier state (an invoice paid, then partly paid, then
+paid again), so any key built from a delivery would drop a real change. A
+repeated delivery is harmless, since the handler fetches the current object
+and writes only what differs, and rare, since Fakturownia retries only
+answers other than 2xx.
 
 The `api_token` is a value the receiver may set on the webhook, not the
 account's API token, and the extension ignores it. The endpoint's URL, with
