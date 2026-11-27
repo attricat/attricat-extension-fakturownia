@@ -1,16 +1,15 @@
 //! The `fakturownia` inbound webhook (attricat:host 1.2).
 //!
-//! Fakturownia documents only its webhook management API, not the payload or
-//! any signature, so a webhook is treated as a **hint**: `receive` keeps the
-//! announced resource and ID, and the handler fetches the object from the API
-//! before it changes anything. A forged request costs one GET at most.
-//!
-//! When `verify_webhook_token` is set, the body's `api_token` must equal the
-//! configured API token (an assumption to verify against a real account).
+//! Fakturownia signs nothing: its body carries the changed object and an
+//! `api_token` of the receiver's choosing, which is ignored. The endpoint's
+//! unguessable URL is the credential, and a delivery is only a **hint**:
+//! `receive` keeps the announced resource and ID, and the handler fetches the
+//! object from the API before it changes anything. A forged request with a
+//! leaked URL costs one GET at most.
 
 use serde_json::{Value, json};
 
-use attricat_fakturownia_sync_core::{Resource, constant_time_eq, parse_webhook};
+use attricat_fakturownia_sync_core::{Resource, parse_webhook};
 
 use crate::attricat::host::api::Event;
 use crate::attricat::host::outcomes::{Failure, Rejection};
@@ -27,7 +26,6 @@ pub const RECEIVED_EVENT: &str = "webhook.received.v1";
 
 const STATUS_OK: u16 = 200;
 const STATUS_BAD_REQUEST: u16 = 400;
-const STATUS_UNAUTHORIZED: u16 = 401;
 const STATUS_NOT_FOUND: u16 = 404;
 const STATUS_METHOD_NOT_ALLOWED: u16 = 405;
 
@@ -55,8 +53,7 @@ pub fn receive(request: WebhookRequest) -> Result<WebhookOutcome, String> {
     let Ok(body) = String::from_utf8(request.body) else {
         return Ok(reply(STATUS_BAD_REQUEST, "body is not UTF-8"));
     };
-    let config = host::config()?;
-    let announcement = match parse_webhook(&body) {
+    let announcement = match parse_webhook(&body, &request.query) {
         Ok(announcement) => announcement,
         // Acknowledged so the sender does not retry a body we will never read.
         Err(reason) => {
@@ -67,16 +64,6 @@ pub fn receive(request: WebhookRequest) -> Result<WebhookOutcome, String> {
             return Ok(reply(STATUS_OK, "ignored"));
         }
     };
-    if config.verify_webhook_token {
-        let token = host::secret(config.token_secret())?;
-        let genuine = announcement
-            .api_token
-            .as_deref()
-            .is_some_and(|sent| constant_time_eq(sent.as_bytes(), token.as_bytes()));
-        if !genuine {
-            return Ok(reply(STATUS_UNAUTHORIZED, "invalid token"));
-        }
-    }
     let kept = json!({
         "resource": announcement.resource.name(),
         "action": announcement.action,

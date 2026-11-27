@@ -5,8 +5,9 @@ Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 
 > **Spike.** This release syncs **clients** both ways and issues **sales
 > invoices** from Attricat records. It has been tested against the local mock
-> in `mock/`, not a real Fakturownia account. The webhook format in particular
-> is assumed; see [Assumptions to verify](#assumptions-to-verify).
+> in `mock/`, and its webhooks against a real account: since 0.4.1 they follow
+> Fakturownia's documented delivery format. See
+> [Assumptions to verify](#assumptions-to-verify) for what is still unchecked.
 >
 > 0.3.0 needs an Attricat Core that lets selection runs read linked records
 > and attach files (`attricat-data.read` `record`/`incoming` in interactive
@@ -18,7 +19,7 @@ Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 | Direction | How | Code |
 | --- | --- | --- |
 | Attricat → Fakturownia | `record.created.v1` / `record.updated.v1` on the configured blueprint (debounced 2 s) push the client with `POST /clients.json` or `PUT /clients/{id}.json`. The export mapping keeps the Fakturownia ID and the hash of the last agreed state. | `sync.rs` (`push_record`) |
-| Fakturownia → Attricat | A Fakturownia webhook is a **hint**: `receive` checks it and keeps only `{resource, action, id}`; the `webhook.received.v1` handler fetches the client again with `GET /clients/{id}.json` and applies it. A forged request costs one GET at most. | `webhook.rs`, `sync.rs` (`apply_client`) |
+| Fakturownia → Attricat | A Fakturownia webhook is a **hint**: `receive` reads the object's key and ID and keeps only `{resource, action, id}`; the `webhook.received.v1` handler fetches the client again with `GET /clients/{id}.json` and applies it. A forged request costs one GET at most. | `webhook.rs`, `sync.rs` (`apply_client`) |
 | Safety net | The `pull` operation pages `GET /clients.json?order=updated_at.desc` back to the watermark of the previous run (Fakturownia has no "changed since" filter) and applies what it finds, merging exactly as the webhook path does. With invoices configured it then pages `GET /invoices.json?period=all&order=updated_at.desc` back to a separate watermark. Run it on a schedule. | `pull.rs` |
 | Issue an invoice | **Issue invoice in Fakturownia** (*Wystaw fakturę w Fakturowni*) on a record's header, or for up to 50 records from the Explorer, runs the `issue-invoices` operation: one invoice per source record, with one result per record in the run. | `invoices.rs` (`process_batch`, `issue`) |
 | Invoice → Attricat | `invoice:*` webhooks are hints too: the handler fetches `GET /invoices/{id}.json` and writes the number, status, view URL and KSeF number and status to the source record, only where they differ. A deleted invoice (404) clears them and removes the mapping, so the record can be invoiced again. | `webhook.rs`, `invoices.rs` (`apply_invoice`, `deleted`) |
@@ -51,7 +52,7 @@ An invoice is issued from a **source** record: a sales order whose lines are rec
 - **Checked before sending.** The buyer must already be a Fakturownia client (it has a client mapping), there must be a position, and every position needs a name, a positive quantity, a price and a tax rate. Otherwise nothing is sent, and the record's export status is `rejected` with every reason, each naming the record (`line 2 (<record ID>): price_net is empty`). An unmapped buyer is **rejected, not pushed**: the run may only write its selected records, so it cannot push the client. Save the client record and issue again.
 - **No warehouse.** Positions carry name, code, quantity, unit (`quantity_unit`), net price and tax, never a Fakturownia `product_id`, and the invoice is sent with `exclude_from_stock_level: true`, so it moves no Fakturownia stock. The extension never recomputes totals. ASSUMED, to check on a warehouse-enabled account: that such an invoice creates no warehouse document (WZ). If it does, turn off the automatic creation of warehouse documents for invoices in the account's warehouse settings; the setting's exact name is not in the API documentation and must be checked there.
 - **Write-back.** After a create, the run writes the number, status, view URL (`https://<account>.fakturownia.pl/invoice/<token>`, which needs no login) and, when configured, KSeF fields to the source, and attaches the PDF (`GET /invoices/{id}.pdf`, fetched with the Bearer header) to the `file` attribute. The writes come from the extension, so they trigger no push. Every write-back field is owned by Fakturownia: the mapping's content hash is the written-back state, so an unchanged webhook writes nothing.
-- **Deleted invoices.** A deleted invoice clears the scalar write-back fields (`remove_values`) and removes the mapping. The PDF stays on the record. The extension never deletes an invoice itself, paid or not. `pull` cannot see deletions (Fakturownia does not list deleted invoices), so only the webhook clears them.
+- **Deleted invoices.** A deleted invoice clears the scalar write-back fields (`remove_values`) and removes the mapping. The PDF stays on the record. The extension never deletes an invoice itself, paid or not. `pull` cannot see deletions (Fakturownia does not list deleted invoices), so only a delete webhook clears them, and Fakturownia documents none for invoices yet.
 - **Invoices made in Fakturownia.** With `link_existing_by_oid`, an invoice whose `oid` equals exactly one source record's order-number attribute (an `attricat.read` `lookup`) is linked to it: mapping and write-back, as if it had been issued from Attricat. Several matches are logged and skipped, as is a record that already has an invoice.
 
 ## Show the actions on a blueprint
@@ -77,8 +78,6 @@ A `detail` stack without `children` keeps the default record layout, and a
 ```json
 {
   "account": "acme",
-  "token_secret": "fakturownia-api-token",
-  "verify_webhook_token": true,
   "clients": {
     "blueprint": "client",
     "context": "default",
@@ -153,9 +152,28 @@ The section is validated against the published revisions before any Fakturownia 
 
 1. Store the API token as the workspace extension secret `fakturownia-api-token`.
 2. Create a webhook endpoint (Webhooks section, or `acli extension webhook create attricat-fakturownia --webhook fakturownia --endpoint main`).
-3. Register its URL in Fakturownia for `client:create`, `client:update` and `client:delete`, and with invoices also for `invoice:create`, `invoice:update` and `invoice:delete`.
-4. Schedule `pull` (for example every 30 minutes). Its first run only sets the watermarks, the invoices one included.
+3. In Fakturownia (Ustawienia → Ustawienia konta → Integracja → Webhooki, or `POST /webhooks.json` with `{"webhook": {"kind": "client:update", "url": "..."}}`), register the endpoint's URL for `client:create` and `client:update`, and with invoices also for `invoice:create` and `invoice:update`. Append `?kind=<kind>` to each URL, such as `…?kind=client:update`: Fakturownia's body does not say which event fired, and the kind keeps a delete apart from the update before it. `client:destroy` is accepted too, but a client deleted in Fakturownia is only logged: the extension never deletes Attricat records. Leave the webhook's **Api token** empty; see [Webhooks](#webhooks).
+4. Schedule `pull` (for example every 30 minutes). Its first run only sets the watermarks, the invoices one included. Attricat 1.9.0 refuses to schedule an operation for an extension whose configuration has a key containing `token` or `secret`, so leave out `token_secret` while its default fits.
 5. With invoices: give the source blueprint the write-back attributes, push the buyers (save each client record once) and, on a warehouse-enabled Fakturownia account, check the warehouse setting described under [Invoices](#invoices).
+
+### Webhooks
+
+Fakturownia documents its deliveries on its help page, [Integracja danych z
+Fakturowni za pomocą
+webhooków](https://pomoc.fakturownia.pl/1239014-integracja-danych-z-fakturowni-za-pomoca-webhookow):
+a POST whose JSON body holds the changed object under `client`, `deal` (an
+invoice) or `product`, with `app_name`, `locale` and `api_token`. The body
+names no event. Any answer other than 2xx, a redirect included, is retried,
+and after 25 failures Fakturownia turns the webhook off and emails the account
+owner. `receive` therefore acknowledges with 200 every body it cannot read.
+
+The `api_token` is a value the receiver may set on the webhook, not the
+account's API token, and the extension ignores it. The endpoint's URL, with
+its unguessable path, is the credential, and a delivery is only a hint: the
+handler fetches the object with the API token before it changes anything, so
+a request with a leaked URL costs one GET at most. To retire a leaked URL,
+rotate the endpoint and register the new URL. `verify_webhook_token` is
+ignored since 0.4.1 and still accepted, so older configurations stay valid.
 
 ## Development
 
@@ -191,7 +209,7 @@ It side-loads the archive, configures a fresh blueprint, registers the webhook e
 - clearing a field (the value is removed, not set to `""`)
 - a lost webhook caught up by `pull`, which merges: it clears an emptied field, keeps Attricat-owned ones, stores the merged hash and pushes nothing back
 - a 422 rejection
-- a forged webhook refused
+- a forged delivery accepted as a hint only, its body data never written, and an unreadable body acknowledged
 - that the token travelled only as a Bearer header
 - a `pull` refused when the configured blueprint code does not exist
 
@@ -222,14 +240,17 @@ vendored WIT is unchanged.
 
 ## Assumptions to verify
 
-Fakturownia documents only its webhook management API (`/webhooks.json`). To check on a real account:
+Checked on a real account: the registration body `{webhook: {kind, url}}`
+answers 201, the kinds `client:create`, `client:update`, `invoice:create` and
+`invoice:update` are accepted and `client:delete` and `invoice:delete` are
+refused with 422, and a client created or edited in the web app is delivered
+with no event kind in its body. Still to check:
 
-- **Registration body** (assumed `{webhook: {kind, url}}`) and the event kinds (assumed `client:create|update|delete`).
-- **Delivery body** (assumed `{kind, api_token, client: {...}}`): is the object complete, and does `api_token` carry the account token? `verify_webhook_token: false` turns that check off.
-- Whether changes made **through the API** fire webhooks, plus retries, timeouts, and whether deletes, payments and KSeF status changes fire.
+- Whether changes made **through the API** fire webhooks, the delivery timeout, and whether payments and KSeF status changes fire.
+- Whether invoices have a delete kind (the mock assumes `invoice:destroy`).
 - Whether clients store and filter by **`external_id`**, which is used to find a create whose answer was lost.
 - The status of a create (assumed 201), the `updated_at` format, and the rate limits (the host permission allows 60 requests a minute).
-- **Invoice webhooks**: the kinds (assumed `invoice:create|update|delete`) and body (assumed `{kind, api_token, invoice: {...}}`), and whether payments and KSeF numbers fire `invoice:update` (the KSeF documentation says a KSeF number does).
+- **Invoice webhooks**: whether payments and KSeF numbers fire `invoice:update` (the KSeF documentation says a KSeF number does).
 - **Invoice lookup**: that `GET /invoices.json` filters by `oid` and `client_id` together, used to find a create whose answer was lost.
 - The 422 Fakturownia answers to a duplicate `oid` with `oid_unique: "yes"`, the number format (the mock uses `FV <n>/<MM>/<YYYY>`), and that an omitted issue or sell date means today.
 - **Warehouse**: that an invoice whose positions have no `product_id`, sent with `exclude_from_stock_level`, creates no warehouse document on a warehouse-enabled account.

@@ -10,11 +10,16 @@
 // The documented parts follow https://github.com/fakturownia/api: Bearer
 // tokens, `/clients.json` CRUD with a `client` root, `page`/`per_page` (at most
 // 100), `order=updated_at.desc`, `external_id` lookup, 422 validation errors
-// and `/webhooks.json` CRUD. ASSUMED, to verify on a real account: the
-// webhook registration body (`{webhook: {kind, url}}`), the delivery body
-// (`{kind, api_token, client: {...}}`), that changes made through the API fire
-// webhooks too, the 201 status of a create, and that clients store
-// `external_id`.
+// and `/webhooks.json` CRUD. Deliveries follow pomoc.fakturownia.pl
+// ("Integracja danych z Fakturowni za pomocą webhooków"): the object under
+// `client` (or `deal` for an invoice, with its ID also at the top level), plus
+// `app_name`, `locale` and an `api_token` that is empty unless set on the
+// webhook; the body names no event. Registration accepts the kinds a real
+// account accepts (`client:create|update|destroy`, `invoice:create|update`)
+// and refuses others with 422, as `client:delete` is. ASSUMED, to verify on a
+// real account: the registration body (`{webhook: {kind, url}}`, which a real
+// account accepts), that changes made through the API fire webhooks too, the
+// 201 status of a create, and that clients store `external_id`.
 //
 // Invoices follow the same documentation: `/invoices.json` CRUD with an
 // `invoice` root, `client_id`, `oid` and `oid_unique`, positions with
@@ -22,8 +27,8 @@
 // issued/sent/paid/partial/rejected, KSeF state in `gov_id`/`gov_status`, the
 // view at `/invoice/{token}`, `GET /invoices/{id}.pdf`, and list filters
 // `oid`, `client_id`, `number`, `period` and `order=updated_at.desc`.
-// ASSUMED: the invoice webhook kinds (`invoice:create|update|delete`) and
-// their body (`{kind, api_token, invoice: {...}}`), the 201 of a create, that
+// ASSUMED: an `invoice:destroy` kind (the help page names none; the mock
+// accepts it so the e2e covers deletes), the 201 of a create, that
 // `oid` and `client_id` filter together, the 422 message of a duplicate
 // `oid`, that an omitted issue or sell date means today, and the number
 // format `FV <n>/<MM>/<YYYY>`. The mock never creates warehouse documents.
@@ -102,6 +107,14 @@ const validationError = (fields) => ({
 const pick = (input = {}) =>
   Object.fromEntries(CLIENT_FIELDS.filter((field) => field in input).map((field) => [field, input[field] ?? '']));
 
+/** The kinds a webhook can be registered for; `invoice:destroy` is ASSUMED. */
+const WEBHOOK_KINDS = new Set(['client:create', 'client:update', 'client:destroy', 'invoice:create', 'invoice:update', 'invoice:destroy']);
+
+/** The documented delivery body: the object under its key, no event kind. */
+const deliveryBody = (resource, object) => (resource === 'invoice'
+  ? { id: object.id, deal: object, app_name: 'fakturownia', api_token: '', locale: 'pl' }
+  : { [resource]: object, app_name: 'fakturownia', api_token: '', locale: 'pl' });
+
 /** Sends `kind` to every matching webhook of the account, fire and forget. */
 const fire = (accountName, kind, object) => {
   const resource = kind.split(':')[0];
@@ -117,7 +130,7 @@ const fire = (accountName, kind, object) => {
     fetch(hook.url, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ kind, api_token: TOKEN, [resource]: object }),
+      body: JSON.stringify(deliveryBody(resource, object)),
     })
       .then(async (answer) => {
         delivery.status = answer.status;
@@ -155,7 +168,7 @@ const deleteClient = (accountName, id) => {
   const client = account(accountName).clients[id];
   if (!client) return false;
   delete account(accountName).clients[id];
-  fire(accountName, 'client:delete', client);
+  fire(accountName, 'client:destroy', client);
   return true;
 };
 
@@ -215,7 +228,7 @@ const deleteInvoice = (accountName, id) => {
   const invoice = account(accountName).invoices[id];
   if (!invoice) return false;
   delete account(accountName).invoices[id];
-  fire(accountName, 'invoice:delete', invoice);
+  fire(accountName, 'invoice:destroy', invoice);
   return true;
 };
 
@@ -333,6 +346,7 @@ const api = async (request, response) => {
   if (url.pathname === '/webhooks.json' && request.method === 'POST') {
     const hook = input.webhook ?? {};
     if (!hook.kind || !hook.url) return json(response, STATUS.unprocessable, validationError([['url', 'nie może być puste']]));
+    if (!WEBHOOK_KINDS.has(hook.kind)) return json(response, STATUS.unprocessable, { kind: ['- nie znajduje się na liście dopuszczalnych wartości'] });
     const id = state.nextId++;
     webhooks[id] = { id, kind: hook.kind, url: hook.url, active: hook.active ?? true };
     return json(response, STATUS.created, webhooks[id]);

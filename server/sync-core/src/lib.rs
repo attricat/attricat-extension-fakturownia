@@ -109,17 +109,15 @@ pub struct Config {
     /// The extension secret holding the API token.
     #[serde(default)]
     pub token_secret: Option<String>,
-    /// Refuse webhook bodies whose `api_token` does not match the API token.
-    #[serde(default = "default_true")]
-    pub verify_webhook_token: bool,
+    /// Ignored since 0.4.1 and kept so older configurations stay valid. The
+    /// body's `api_token` is a value of the receiver's choosing, not the API
+    /// token; the endpoint's unguessable URL authenticates deliveries.
+    #[serde(default)]
+    pub verify_webhook_token: Option<bool>,
     pub clients: ClientSync,
     /// Invoices issued from Attricat records; optional.
     #[serde(default)]
     pub invoices: Option<invoices::InvoiceSync>,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 impl Config {
@@ -269,16 +267,6 @@ pub enum Resource {
 }
 
 impl Resource {
-    fn parse(name: &str) -> Option<Self> {
-        Some(match name {
-            "client" => Resource::Client,
-            "product" => Resource::Product,
-            "invoice" => Resource::Invoice,
-            "payment" => Resource::Payment,
-            _ => return None,
-        })
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Resource::Client => "client",
@@ -294,12 +282,12 @@ impl Resource {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Announcement {
     pub resource: Resource,
-    /// `create`, `update`, `delete` or whatever Fakturownia sends.
+    /// The action from the registered URL's `?kind=<resource>:<action>`, such
+    /// as `destroy`, or `change` when the URL names none. Fakturownia's body
+    /// does not say which event fired.
     pub action: String,
     pub id: i64,
     pub updated_at: Option<String>,
-    /// The `api_token` field, if the body carries one.
-    pub api_token: Option<String>,
 }
 
 impl Announcement {
@@ -315,50 +303,61 @@ impl Announcement {
     }
 }
 
-/// Parses an assumed Fakturownia webhook body:
-/// `{"kind": "<resource>:<action>", "api_token": "...", "<resource>": {...}}`.
-/// The object may instead be under `object`. The real format is unverified.
-pub fn parse_webhook(body: &str) -> Result<Announcement, String> {
+/// The top-level keys Fakturownia puts the changed object under, and what
+/// each announces. An invoice arrives as `deal`; its body also nests the
+/// buyer under `deal.client`, so invoices are matched before clients.
+const WEBHOOK_OBJECTS: [(&str, Resource); 5] = [
+    ("deal", Resource::Invoice),
+    ("invoice", Resource::Invoice),
+    ("payment", Resource::Payment),
+    ("product", Resource::Product),
+    ("client", Resource::Client),
+];
+
+/// Parses a Fakturownia webhook delivery, as documented at
+/// pomoc.fakturownia.pl ("Integracja danych z Fakturowni za pomocą
+/// webhooków"): `{"client": {...}, "app_name": "fakturownia",
+/// "api_token": "...", "locale": "pl"}`, with the object under `client`,
+/// `deal` (invoices) or `product`. The body names no event, so the action
+/// comes from `kind=<resource>:<action>` in the registered URL's `query`, if
+/// there is one. `api_token` is ignored.
+pub fn parse_webhook(body: &str, query: &str) -> Result<Announcement, String> {
     let body: Value = serde_json::from_str(body).map_err(|_| "body is not JSON".to_owned())?;
-    let kind = body
-        .get("kind")
-        .and_then(Value::as_str)
-        .ok_or("missing kind")?;
-    let (resource_name, action) = kind.split_once(':').ok_or("kind is not resource:action")?;
-    let resource = Resource::parse(resource_name).ok_or("unsupported resource")?;
-    let object = body
-        .get(resource_name)
-        .or_else(|| body.get("object"))
-        .and_then(Value::as_object)
-        .ok_or("missing object")?;
+    let (object, resource) = WEBHOOK_OBJECTS
+        .iter()
+        .find_map(|(key, resource)| Some((body.get(*key)?.as_object()?, *resource)))
+        .ok_or("no client, deal or product object")?;
     let id = object
         .get("id")
+        .or_else(|| body.get("id"))
         .and_then(|id| id.as_i64().or_else(|| id.as_str()?.parse().ok()))
         .ok_or("missing object id")?;
     Ok(Announcement {
         resource,
-        action: action.to_owned(),
+        action: query_action(query).unwrap_or_else(|| "change".to_owned()),
         id,
         updated_at: object
             .get("updated_at")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        api_token: body
-            .get("api_token")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
     })
 }
 
-/// Compares secrets without an early exit on the first difference.
-pub fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0u8, |difference, (a, b)| difference | (a ^ b))
-        == 0
+/// The action of a `kind=<resource>:<action>` query parameter, with the colon
+/// either literal or percent-encoded.
+fn query_action(query: &str) -> Option<String> {
+    let kind = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("kind="))?
+        .replace("%3A", ":")
+        .replace("%3a", ":");
+    let (_, action) = kind.split_once(':')?;
+    let valid = !action.is_empty()
+        && action.len() <= 32
+        && action
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_');
+    valid.then(|| action.to_owned())
 }
 
 /// Fakturownia's validation error body: `{"code":"error","message":{"field":["- text"]}}`.
@@ -542,24 +541,54 @@ mod tests {
     }
 
     #[test]
-    fn webhooks_parse_the_assumed_format() {
-        let announcement = parse_webhook(
-            &json!({"kind": "client:update", "api_token": "t",
-                "client": {"id": 42, "updated_at": "2026-11-25T10:00:00.000+01:00"}})
-            .to_string(),
-        )
-        .unwrap();
+    fn webhooks_parse_the_documented_format() {
+        let client = json!({"client": {"id": 42, "name": "Acme",
+            "updated_at": "2026-11-25T10:00:00.000+01:00"},
+            "app_name": "fakturownia", "api_token": "", "locale": "pl"})
+        .to_string();
+        let announcement = parse_webhook(&client, "").unwrap();
         assert_eq!(announcement.resource, Resource::Client);
         assert_eq!(announcement.id, 42);
         assert_eq!(
             announcement.dedupe_key(),
-            "client:42:update:2026-11-25T10:00:00.000+01:00"
+            "client:42:change:2026-11-25T10:00:00.000+01:00"
         );
-        let object_form =
-            parse_webhook(r#"{"kind":"invoice:create","object":{"id":"9"}}"#).unwrap();
-        assert_eq!(object_form.id, 9);
-        assert!(parse_webhook(r#"{"kind":"deal:create","deal":{"id":1}}"#).is_err());
-        assert!(parse_webhook("not json").is_err());
+        // The registered URL's kind keeps a delete apart from the last update.
+        assert_eq!(
+            parse_webhook(&client, "kind=client%3Adestroy")
+                .unwrap()
+                .dedupe_key(),
+            "client:42:destroy:2026-11-25T10:00:00.000+01:00"
+        );
+        assert_eq!(
+            parse_webhook(&client, "a=1&kind=client:update")
+                .unwrap()
+                .action,
+            "update"
+        );
+        assert_eq!(
+            parse_webhook(&client, "kind=client:DROP%20TABLE")
+                .unwrap()
+                .action,
+            "change"
+        );
+
+        // An invoice arrives as `deal`, with its buyer nested inside it.
+        let invoice = parse_webhook(
+            &json!({"id": 9, "deal": {"id": "9", "invoice_no": "FV 1/11/2026",
+                "client": {"id": 42}}, "app_name": "fakturownia", "api_token": "",
+                "locale": "pl"})
+            .to_string(),
+            "",
+        )
+        .unwrap();
+        assert_eq!((invoice.resource, invoice.id), (Resource::Invoice, 9));
+        let product = parse_webhook(r#"{"product":{"id":7},"app_name":"fakturownia"}"#, "");
+        assert_eq!(product.unwrap().resource, Resource::Product);
+
+        assert!(parse_webhook(r#"{"app_name":"fakturownia","api_token":""}"#, "").is_err());
+        assert!(parse_webhook(r#"{"client":{"name":"no id"}}"#, "").is_err());
+        assert!(parse_webhook("not json", "").is_err());
     }
 
     #[test]
@@ -620,12 +649,5 @@ mod tests {
             validation_message(r#"{"code":"error","message":{"name":["- nie może być puste"]}}"#),
             "name: nie może być puste"
         );
-    }
-
-    #[test]
-    fn constant_time_eq_compares_bytes() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

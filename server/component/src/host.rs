@@ -33,11 +33,6 @@ pub fn config() -> Result<Config, String> {
     Config::parse(&api::call("configuration.get.v1", "{}")?)
 }
 
-pub fn secret(name: &str) -> Result<String, String> {
-    let secret = call("secrets.get.v1", &json!({"name": name}))?;
-    Ok(secret["value"].as_str().unwrap_or_default().to_owned())
-}
-
 /// Best-effort structured logging; a log failure never fails the work.
 pub fn log(level: &str, message: &str) {
     let _ = api::log(level, message);

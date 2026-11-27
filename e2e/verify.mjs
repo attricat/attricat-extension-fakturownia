@@ -177,10 +177,12 @@ await api('POST', `/extensions/${extensionId}/enable`);
 step('create a webhook endpoint and register it in Fakturownia');
 const endpoint = await api('POST', `/extensions/${extensionId}/webhook-endpoints`, { webhook: 'fakturownia', endpoint: 'main' });
 assert(endpoint.url, 'set EXTENSION_WEBHOOK_BASE_URL so endpoints have a full URL');
-for (const kind of ['client:create', 'client:update', 'client:delete', 'invoice:create', 'invoice:update', 'invoice:delete']) {
-  const registered = await fakturownia('POST', '/webhooks.json', { webhook: { kind, url: endpoint.url } });
+// Each kind gets its own ?kind=, since the body does not say which event fired.
+for (const kind of ['client:create', 'client:update', 'client:destroy', 'invoice:create', 'invoice:update', 'invoice:destroy']) {
+  const registered = await fakturownia('POST', '/webhooks.json', { webhook: { kind, url: `${endpoint.url}?kind=${kind}` } });
   assert.equal(registered.status, 201);
 }
+assert.equal((await fakturownia('POST', '/webhooks.json', { webhook: { kind: 'client:delete', url: endpoint.url } })).status, 422);
 
 step('a pull without a watermark only records one');
 const pull = async (key) => {
@@ -544,13 +546,18 @@ assert.deepEqual(created6.positions, [{ name: 'Pallet', quantity: '4', price_net
 assert.equal((await values(goodsIssue)).invoice_number, (await invoicesIn()).find((invoice) => invoice.oid === number6).number);
 await configureInvoices(orderInvoices());
 
-step('a webhook with a wrong token is refused and kept nowhere');
-const forged = await fetch(endpoint.url, {
+step('a delivery is only a hint: its api_token is ignored and its object data never written');
+const before = await values(acme);
+const forged = await fetch(`${endpoint.url}?kind=client:update`, {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ kind: 'client:update', api_token: 'guess', client: { id: remote.id } }),
+  body: JSON.stringify({ client: { id: remote.id, name: 'Forged name' }, app_name: 'fakturownia', api_token: 'guess', locale: 'pl' }),
 });
-assert.equal(forged.status, 401);
+assert.equal(forged.status, 200);
+await sleep(3000);
+assert.equal((await values(acme)).name, before.name, 'the name comes from the API, not the body');
+const unreadable = await fetch(endpoint.url, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{"app_name":"fakturownia"}' });
+assert.equal(unreadable.status, 200, 'a body without an object is acknowledged so Fakturownia does not retry it');
 
 step('the token only ever travelled as a Bearer header');
 const all = await mock('GET', '/requests');

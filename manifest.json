@@ -1,7 +1,7 @@
 {
   "manifest_version": 1,
   "name": "Fakturownia",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Two-way sync of clients, and sales invoices issued from Attricat records, between Attricat and Fakturownia (spike).",
   "icons": {
     "48": "assets/icon-48.svg"
@@ -77,7 +77,7 @@
         },
         "verify_webhook_token": {
           "type": "boolean",
-          "description": "Refuse webhooks whose api_token field does not match the API token (default true)."
+          "description": "Ignored since 0.4.1; the endpoint URL authenticates webhooks. Accepted so older configurations stay valid."
         },
         "clients": {
           "type": "object",
