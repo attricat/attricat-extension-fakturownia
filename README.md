@@ -3,7 +3,7 @@
 Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 **`attricat:host@1.2.0`** ABI.
 
-> **Spike.** This release syncs **clients** both ways and issues **sales
+> This release syncs **clients** both ways and issues **sales
 > invoices** from Attricat records. It has been tested against the local mock
 > in `mock/`, and its webhooks and invoice issuing against a real account:
 > since 0.4.1 webhooks follow Fakturownia's documented delivery format, and
@@ -233,11 +233,11 @@ and, with a fresh order, line, product and unit blueprint set and a single-line 
 - an invoice made in the mock linked to its order with `link_existing_by_oid`
 - a single-line goods issue invoiced from the record itself
 
-## Spike findings
+## Open issues
 
 Found while building against the host. These need Core work or a decision.
 Reading records from operation runs, looking up blueprints and contexts by
-code, and clearing values of any type were added to Core after the spike
+code, and clearing values of any type were added to Core after the first version
 (`attricat.read` `record`, `blueprint` and `context`; intents' `remove_values`)
 and are used since 0.2.0. For invoices, Core then let selection runs read the
 records linked from their selection and attach a fetched file to a selected
