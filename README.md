@@ -153,7 +153,7 @@ The section is validated against the published revisions before any Fakturownia 
 
 **Setup:**
 
-1. Store the API token as the workspace extension secret `fakturownia-api-token`.
+1. Set the extension's `fakturownia-api-token` secret to the API token: the manifest declares it as required, so the extension's **Secrets** tab lists it (or `printf %s "$TOKEN" | acli extension secret set attricat-fakturownia fakturownia-api-token --value-stdin`). Secrets belong to this extension and need Attricat 1.12 or later. To use another name, set `token_secret` and add a secret by that name.
 2. Create a webhook endpoint (Webhooks section, or `acli extension webhook create attricat-fakturownia --webhook fakturownia --endpoint main`).
 3. In Fakturownia (Ustawienia → Ustawienia konta → Integracja → Webhooki, or `POST /webhooks.json` with `{"webhook": {"kind": "client:update", "url": "..."}}`), register the endpoint's URL for `client:create` and `client:update`, and with invoices also for `invoice:create` and `invoice:update`. Append `?kind=<kind>` to each URL, such as `…?kind=client:update`: Fakturownia's body does not say which event fired, and the kind is kept with each delivery, so the webhook receipts show it. `client:destroy` is accepted too, but a client deleted in Fakturownia is only logged: the extension never deletes Attricat records. Leave the webhook's **Api token** empty; see [Webhooks](#webhooks).
 4. Schedule `pull` (for example every 30 minutes). Its first run only sets the watermarks, the invoices one included. Attricat 1.9.0 refuses to schedule an operation for an extension whose configuration has a key containing `token` or `secret`, so leave out `token_secret` while its default fits.
