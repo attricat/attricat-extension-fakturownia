@@ -5,8 +5,9 @@ Two-way sync between Attricat and [Fakturownia](https://fakturownia.pl), on the
 
 > **Spike.** This release syncs **clients** both ways and issues **sales
 > invoices** from Attricat records. It has been tested against the local mock
-> in `mock/`, and its webhooks against a real account: since 0.4.1 they follow
-> Fakturownia's documented delivery format. See
+> in `mock/`, and its webhooks and invoice issuing against a real account:
+> since 0.4.1 webhooks follow Fakturownia's documented delivery format, and
+> since 0.4.2 positions carry the gross total a real account requires. See
 > [Assumptions to verify](#assumptions-to-verify) for what is still unchecked.
 >
 > 0.3.0 needs an Attricat Core that lets selection runs read linked records
@@ -246,7 +247,13 @@ Checked on a real account: the registration body `{webhook: {kind, url}}`
 answers 201, the kinds `client:create`, `client:update`, `invoice:create` and
 `invoice:update` are accepted and `client:delete` and `invoice:delete` are
 refused with 422, and a client created or edited in the web app is delivered
-with no event kind in its body. Still to check:
+with no event kind in its body. Creating an invoice (`POST /invoices.json`)
+without a `product_id` needs `total_price_gross` on every position, and with
+no `seller_name` or `department_id` it takes the seller from the account's
+company details (Ustawienia → Dane firmy): an account without them answers
+422 with `seller_name: pole nie może być puste`, and the same answer lists
+every position's missing gross total. The view link, the PDF and the
+`invoice:create` webhook work as described. Still to check:
 
 - Whether changes made **through the API** fire webhooks, the delivery timeout, and whether payments and KSeF status changes fire.
 - Whether invoices have a delete kind (the mock assumes `invoice:destroy`).
@@ -254,7 +261,7 @@ with no event kind in its body. Still to check:
 - The status of a create (assumed 201), the `updated_at` format, and the rate limits (the host permission allows 60 requests a minute).
 - **Invoice webhooks**: whether payments and KSeF numbers fire `invoice:update` (the KSeF documentation says a KSeF number does).
 - **Invoice lookup**: that `GET /invoices.json` filters by `oid` and `client_id` together, used to find a create whose answer was lost.
-- The 422 Fakturownia answers to a duplicate `oid` with `oid_unique: "yes"`, the number format (the mock uses `FV <n>/<MM>/<YYYY>`), and that an omitted issue or sell date means today.
+- The 422 Fakturownia answers to a duplicate `oid` with `oid_unique: "yes"` (a real account numbered its first invoice `1/11/2026`: the format follows the account's numbering settings, and the mock uses `FV <n>/<MM>/<YYYY>`), and that an omitted issue or sell date means today.
 - **Warehouse**: that an invoice whose positions have no `product_id`, sent with `exclude_from_stock_level`, creates no warehouse document on a warehouse-enabled account.
 
 ## Next
