@@ -436,8 +436,9 @@ assert.equal(created1.description, `Order ${number1}`);
 assert.equal(created1.payment_to_kind, '14');
 assert.equal(created1.exclude_from_stock_level, true);
 assert.deepEqual(created1.positions, [
-  { name: 'Widget', code: 'W-1', quantity: '2', quantity_unit: 'szt', price_net: '10.5', tax: '23' },
-  { name: 'Gadget', code: 'G-2', quantity: '1', quantity_unit: 'szt', price_net: '99', tax: '23' },
+  // 2 × 10.50 = 21.00 net + 4.83 VAT; 99.00 net + 22.77 VAT.
+  { name: 'Widget', code: 'W-1', quantity: '2', quantity_unit: 'szt', price_net: '10.5', tax: '23', total_price_gross: '25.83' },
+  { name: 'Gadget', code: 'G-2', quantity: '1', quantity_unit: 'szt', price_net: '99', tax: '23', total_price_gross: '121.77' },
 ]);
 assert(created1.positions.every((position) => !('product_id' in position)), 'no Fakturownia product, so no stock moves');
 const invoice1 = (await invoicesIn()).find((invoice) => invoice.oid === number1);
@@ -523,7 +524,7 @@ await configureInvoices(orderInvoices({ link_existing_by_oid: true }));
 const number5 = `ZS/5/${suffix}`;
 const order5 = await order(number5, [{ item: widget, quantity: 1, price: 1 }]);
 const { id: manualId } = await mock('POST', `/ui/${account}/invoices`, { oid: number5, client_id: remote.id,
-  positions: [{ name: 'Typed by hand', quantity: 1, price_net: 1, tax: '23' }] });
+  positions: [{ name: 'Typed by hand', quantity: 1, price_net: 1, tax: '23', total_price_gross: '1.23' }] });
 await waitFor('the linked order', async () => (await mapping(order5))?.external_id === `invoice:${manualId}`);
 assert.equal((await values(order5)).invoice_status, 'issued');
 
@@ -542,7 +543,7 @@ const goodsIssue = (await api('POST', '/v1/records', { blueprint: { code: codes.
 const single = await issueInvoices(issueBlueprint, [goodsIssue], 'issue-6');
 assert.equal(results(single)[0]?.outcome, 'succeeded', JSON.stringify(single.progress));
 const created6 = (await invoiceCreates()).map((request) => request.body.invoice).find((invoice) => invoice.oid === number6);
-assert.deepEqual(created6.positions, [{ name: 'Pallet', quantity: '4', price_net: '12', tax: '8' }]);
+assert.deepEqual(created6.positions, [{ name: 'Pallet', quantity: '4', price_net: '12', tax: '8', total_price_gross: '51.84' }]);
 assert.equal((await values(goodsIssue)).invoice_number, (await invoicesIn()).find((invoice) => invoice.oid === number6).number);
 await configureInvoices(orderInvoices());
 

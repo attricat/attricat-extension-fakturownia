@@ -509,6 +509,55 @@ fn tax_rate(text: &str) -> Option<String> {
     }
 }
 
+/// A non-negative decimal as an exact mantissa and scale: `19.11` is
+/// `(1911, 2)`. At most 12 digits after the point and 18 in all.
+fn fixed(text: &str) -> Option<(i128, u32)> {
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
+    let digits = format!("{whole}{fraction}");
+    let valid = !digits.is_empty()
+        && digits.len() <= 18
+        && fraction.len() <= 12
+        && digits.bytes().all(|byte| byte.is_ascii_digit());
+    valid.then(|| Some((digits.parse().ok()?, fraction.len() as u32)))?
+}
+
+/// `mantissa / 10^scale` rounded half up to a whole number.
+fn round_whole(mantissa: i128, scale: u32) -> Option<i128> {
+    let divisor = 10_i128.checked_pow(scale)?;
+    Some(mantissa.checked_add(divisor / 2)? / divisor)
+}
+
+/// `mantissa / 10^scale` rounded half up to grosze (hundredths).
+fn round_to_grosze(mantissa: i128, scale: u32) -> Option<i128> {
+    match scale.checked_sub(2) {
+        Some(excess) => round_whole(mantissa, excess),
+        None => mantissa.checked_mul(10_i128.checked_pow(2 - scale)?),
+    }
+}
+
+/// A position's gross value in grosze, as an invoice computes it: the net
+/// value (price × quantity) rounded to the grosz, plus the VAT on that net
+/// value rounded to the grosz. `zw` and `np` carry no VAT.
+fn gross_grosze(price_net: &str, quantity: &str, rate: &str) -> Option<i128> {
+    let (price, price_scale) = fixed(price_net)?;
+    let (amount, amount_scale) = fixed(quantity)?;
+    let net = round_to_grosze(price.checked_mul(amount)?, price_scale + amount_scale)?;
+    let vat = match rate {
+        "zw" | "np" => 0,
+        _ => {
+            let (rate, rate_scale) = fixed(rate)?;
+            // net (grosze) × rate / 100, in grosze.
+            round_whole(net.checked_mul(rate)?, rate_scale + 2)?
+        }
+    };
+    net.checked_add(vat)
+}
+
+/// Grosze as a Fakturownia amount: `23505` is `"235.05"`.
+fn amount(grosze: i128) -> String {
+    format!("{}.{:02}", grosze / 100, grosze % 100)
+}
+
 /// Builds one invoice position, or every reason it cannot be sent, each
 /// naming `label` (the record it comes from) and the field.
 pub fn position(
@@ -562,6 +611,20 @@ pub fn position(
         }
         Some((text, None)) => errors.push(format!("{label}: tax {text} is not a rate")),
         None => errors.push(missing("tax")),
+    }
+    // Fakturownia derives the other amounts but not the gross total, which a
+    // position without a product must carry.
+    if let (Some(Value::String(price)), Some(Value::String(quantity)), Some(Value::String(rate))) =
+        (body.get("price_net"), body.get("quantity"), body.get("tax"))
+    {
+        match gross_grosze(price, quantity, rate) {
+            Some(gross) => {
+                body.insert("total_price_gross".into(), json!(amount(gross)));
+            }
+            None => errors.push(format!(
+                "{label}: price_net {price}, quantity {quantity} and tax {rate} give no gross amount"
+            )),
+        }
     }
     if errors.is_empty() {
         Ok(body)
@@ -934,7 +997,8 @@ mod tests {
         assert_eq!(
             Value::Object(built),
             json!({"name": "Widget", "code": "SKU-1", "quantity": "2.5",
-                "quantity_unit": "szt", "price_net": "10.00", "tax": "23"})
+                "quantity_unit": "szt", "price_net": "10.00", "tax": "23",
+                "total_price_gross": "30.75"})
         );
         let mut positions = sync().positions;
         positions.tax = Tax {
@@ -961,6 +1025,34 @@ mod tests {
         )
         .unwrap();
         assert_eq!(exempt["tax"], "zw");
+        assert_eq!(exempt["total_price_gross"], "1.00");
+    }
+
+    #[test]
+    fn the_gross_total_rounds_net_and_vat_to_the_grosz() {
+        let gross = |price: &str, quantity: &str, tax: &str| {
+            position(
+                &sync().positions,
+                "l",
+                &PositionValues {
+                    tax: Some(tax.into()),
+                    ..values(Some("Widget"), Some(quantity), Some(price))
+                },
+            )
+            .map(|body| body["total_price_gross"].clone())
+        };
+        // 10 × 19.11 = 191.10 net, 43.953 → 43.95 VAT.
+        assert_eq!(gross("19.11", "10", "23").unwrap(), "235.05");
+        // 3 × 0.333 = 0.999 → 1.00 net before the VAT, not after.
+        assert_eq!(gross("0.333", "3", "23").unwrap(), "1.23");
+        // 0.005 VAT rounds half up.
+        assert_eq!(gross("0.10", "1", "5").unwrap(), "0.11");
+        // 12.5 × 0.125 = 1.5625 → 1.56 net, 0.1248 → 0.12 VAT.
+        assert_eq!(gross("12,5", "0,125", "8").unwrap(), "1.68");
+        assert_eq!(gross("100", "1", "np").unwrap(), "100.00");
+        assert_eq!(gross("0", "4", "23").unwrap(), "0.00");
+        assert!(gross("1e3", "1", "23").is_err());
+        assert!(gross("1", "1234567890123456789", "23").is_err());
     }
 
     #[test]
@@ -994,7 +1086,8 @@ mod tests {
             json!({"invoice": {"kind": "vat", "client_id": 42, "oid": "ZS/1", "oid_unique": "yes",
                 "sell_date": "2026-11-26", "payment_to_kind": "14", "payment_type": "transfer",
                 "currency": "PLN", "exclude_from_stock_level": true,
-                "positions": [{"name": "Widget", "quantity": "1", "price_net": "5", "tax": "23"}]}})
+                "positions": [{"name": "Widget", "quantity": "1", "price_net": "5", "tax": "23",
+                    "total_price_gross": "6.15"}]}})
         );
         assert_eq!(sync.oid(&HeaderValues::new(), "rec-1"), "rec-1");
     }

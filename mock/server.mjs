@@ -23,7 +23,8 @@
 //
 // Invoices follow the same documentation: `/invoices.json` CRUD with an
 // `invoice` root, `client_id`, `oid` and `oid_unique`, positions with
-// `name`/`code`/`quantity`/`quantity_unit`/`price_net`/`tax`, statuses
+// `name`/`code`/`quantity`/`quantity_unit`/`price_net`/`tax`/`total_price_gross`
+// (required without a `product_id`, as a real account answers), statuses
 // issued/sent/paid/partial/rejected, KSeF state in `gov_id`/`gov_status`, the
 // view at `/invoice/{token}`, `GET /invoices/{id}.pdf`, and list filters
 // `oid`, `client_id`, `number`, `period` and `order=updated_at.desc`.
@@ -60,7 +61,7 @@ const TOKEN = process.env.MOCK_API_TOKEN ?? 'mock-api-token';
 const MAX_PER_PAGE = 100;
 const DEFAULT_PER_PAGE = 25;
 const INVOICE_FIELDS = ['kind', 'client_id', 'oid', 'issue_date', 'sell_date', 'description', 'payment_to_kind', 'payment_type', 'currency', 'status', 'gov_id', 'gov_status', 'exclude_from_stock_level', 'positions'];
-const POSITION_FIELDS = ['name', 'code', 'quantity', 'quantity_unit', 'price_net', 'tax', 'product_id'];
+const POSITION_FIELDS = ['name', 'code', 'quantity', 'quantity_unit', 'price_net', 'tax', 'total_price_gross', 'product_id'];
 const CLIENT_FIELDS = ['name', 'tax_no', 'email', 'phone', 'street', 'city', 'post_code', 'country', 'external_id'];
 const STATUS = { ok: 200, created: 201, noContent: 204, badRequest: 400, unauthorized: 401, notFound: 404, unprocessable: 422 };
 
@@ -182,6 +183,11 @@ const createInvoice = (accountName, input = {}) => {
   if (!positions.length) return invoiceError([['positions', 'nie może być puste']]);
   const missing = positions.findIndex((position) => !String(position.name ?? '').trim());
   if (missing >= 0) return invoiceError([[`positions[${missing}].name`, 'nie może być puste']]);
+  // A real account computes the other amounts but refuses a position without
+  // a product and without its gross total.
+  if (positions.some((position) => !position.product_id && !String(position.total_price_gross ?? '').trim())) {
+    return invoiceError([['positions.total_price_gross', 'pole nie może być puste']]);
+  }
   if (input.oid_unique === 'yes' && input.oid && Object.values(store.invoices).some((invoice) => invoice.oid === input.oid)) {
     return invoiceError([['oid', 'jest już zajęte']]);
   }
