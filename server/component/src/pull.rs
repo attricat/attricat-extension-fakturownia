@@ -12,16 +12,15 @@ use serde_json::{Value, json};
 use attricat_fakturownia_sync_core::timestamp_millis;
 
 use crate::attricat::host::clock;
-use crate::attricat::host::outcomes::{Failure, Retry};
+use crate::attricat::host::outcomes::Failure;
 use crate::exports::attricat::host::deferrable_operations::{BatchOutcome, OperationRequest};
-use crate::host::{self, Http, Mode, decode, encode};
+use crate::host::{self, Http, Mode, budget_spent, decode, encode, failed_response, retry};
 use crate::{invoices, sync};
 
 pub const OPERATION: &str = "pull";
 /// Objects per page; Fakturownia allows at most 100.
 const PAGE_SIZE: usize = 25;
 const STATUS_OK: u16 = 200;
-const RETRY_AFTER_MS: u64 = 5_000;
 
 /// What a pull pages, in order.
 #[derive(Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -62,13 +61,6 @@ struct Checkpoint {
     applied: u32,
 }
 
-fn retry(message: &str, after_ms: u64) -> Failure {
-    Failure::Retry(Retry {
-        message: message.into(),
-        after_ms: Some(after_ms),
-    })
-}
-
 /// Refuses to start, with a JSON error, when the configured blueprint or context does not exist.
 pub fn prepare(request: &OperationRequest) -> Result<String, String> {
     let config = host::config()?;
@@ -107,18 +99,21 @@ pub fn process_batch(request: &OperationRequest) -> Result<BatchOutcome, Failure
     let watermark = host::storage_get(phase.watermark_key())?.and_then(|value| value.as_i64());
     let page = checkpoint.page + 1;
     let objects = match host::fakturownia(&config, "GET", &phase.list_path(page), None)? {
-        Http::Response { status, body } if status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_OK => {
             let objects: Value = decode(&body, "list")?;
             objects.as_array().cloned().unwrap_or_default()
         }
-        Http::Response { status, .. } => {
-            return Err(retry(
-                &format!("Fakturownia answered HTTP {status}"),
-                RETRY_AFTER_MS,
-            ));
+        // A refused token or request ends the run with Fakturownia's reason;
+        // throttling and server errors retry the page.
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => return Err(failed_response(status, &body, retry_after.as_deref(), None)),
+        Http::RateLimited(after_ms) => return Err(budget_spent(after_ms)),
+        _ => {
+            return Err(retry("Fakturownia did not answer; retrying later.", None));
         }
-        Http::RateLimited(after_ms) => return Err(retry("request budget spent", after_ms)),
-        _ => return Err(retry("Fakturownia did not answer", RETRY_AFTER_MS)),
     };
     let mut reached_watermark = objects.len() < PAGE_SIZE;
     for object in &objects {

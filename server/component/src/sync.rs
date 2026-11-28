@@ -6,63 +6,19 @@ use serde_json::{Map, Value, json};
 
 use attricat_fakturownia_sync_core::{
     CLIENT_ROOT, Config, local_projection, merge_inbound, outbound_client, projection_hash,
-    validation_message,
 };
 
-use crate::attricat::host::outcomes::{Failure, Rejection, Retry};
-use crate::host::{self, Begin, Http, Mode};
+use crate::attricat::host::outcomes::Failure;
+use crate::host::{self, Begin, Http, Mode, budget_spent, failed_response, rejected, retry};
 
 const STATUS_OK: u16 = 200;
 const STATUS_CREATED: u16 = 201;
-const STATUS_UNAUTHORIZED: u16 = 401;
-const STATUS_FORBIDDEN: u16 = 403;
 const STATUS_NOT_FOUND: u16 = 404;
-const STATUS_UNPROCESSABLE: u16 = 422;
-const STATUS_TOO_MANY_REQUESTS: u16 = 429;
-/// Wait before retrying a throttled or failed Fakturownia request.
-const RETRY_AFTER_MS: u64 = 5_000;
 /// Mapping statuses (see the host's export mapping store).
 const SYNCED: &str = "synced";
 const UNCERTAIN: &str = "uncertain";
 /// Bound of an intent key.
 const MAX_INTENT_KEY_BYTES: usize = 128;
-
-fn rejected(code: &str, message: String, record_id: Option<&str>) -> Failure {
-    Failure::Rejected(Rejection {
-        code: code.into(),
-        message,
-        record_id: record_id.map(str::to_owned),
-        connection: None,
-    })
-}
-
-fn retry(message: &str, after_ms: u64) -> Failure {
-    Failure::Retry(Retry {
-        message: message.into(),
-        after_ms: Some(after_ms),
-    })
-}
-
-/// Maps an unusable Fakturownia answer to the delivery's outcome.
-fn failed_response(status: u16, body: &str, record_id: Option<&str>) -> Failure {
-    match status {
-        STATUS_UNAUTHORIZED | STATUS_FORBIDDEN => rejected(
-            "fakturownia_unauthorized",
-            "Fakturownia refused the API token".into(),
-            record_id,
-        ),
-        STATUS_UNPROCESSABLE => {
-            rejected("fakturownia_invalid", validation_message(body), record_id)
-        }
-        STATUS_TOO_MANY_REQUESTS => retry("Fakturownia throttled the request", RETRY_AFTER_MS),
-        status if status >= 500 => retry("Fakturownia failed to answer", RETRY_AFTER_MS),
-        status => rejected(
-            "fakturownia_unexpected",
-            format!("Fakturownia answered HTTP {status}"),
-            record_id,
-        ),
-    }
-}
 
 fn client_id(body: &str) -> Option<String> {
     let client: Value = serde_json::from_str(body).ok()?;
@@ -115,7 +71,12 @@ pub fn push_record(config: &Config, record_id: &str, revision: Option<i64>) -> R
             mapping,
         } => (lease_token, mapping),
         Begin::Stale => return Ok(()),
-        Begin::Busy => return Err(retry("another push holds the record", RETRY_AFTER_MS)),
+        Begin::Busy => {
+            return Err(retry(
+                "Another push holds the record; retrying later.",
+                None,
+            ));
+        }
     };
     let mut external_id = mapping["external_id"].as_str().map(str::to_owned);
     if external_id.is_some() && mapping["content_hash"].as_str() == Some(hash.as_str()) {
@@ -144,7 +105,7 @@ pub fn push_record(config: &Config, record_id: &str, revision: Option<i64>) -> R
         host::release(record_id, &lease_token);
     })?;
     match answer {
-        Http::Response { status, body } if status == STATUS_OK || status == STATUS_CREATED => {
+        Http::Response { status, body, .. } if status == STATUS_OK || status == STATUS_CREATED => {
             let id = client_id(&body).or(external_id);
             host::commit(
                 record_id,
@@ -157,12 +118,16 @@ pub fn push_record(config: &Config, record_id: &str, revision: Option<i64>) -> R
         Http::Response { status, .. } if status == STATUS_NOT_FOUND && external_id.is_some() => {
             Err(rejected(
                 "fakturownia_client_missing",
-                "the client was deleted in Fakturownia".into(),
+                "The client was deleted in Fakturownia, so the record cannot be pushed.".into(),
                 Some(record_id),
             ))
         }
-        Http::Response { status, body } => {
-            let failure = failed_response(status, &body, Some(record_id));
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => {
+            let failure = failed_response(status, &body, retry_after.as_deref(), Some(record_id));
             if matches!(failure, Failure::Retry(_)) {
                 host::release(record_id, &lease_token);
             }
@@ -170,18 +135,21 @@ pub fn push_record(config: &Config, record_id: &str, revision: Option<i64>) -> R
         }
         Http::RateLimited(after_ms) => {
             host::release(record_id, &lease_token);
-            Err(retry("request budget spent", after_ms))
+            Err(budget_spent(after_ms))
         }
         Http::Unreachable => {
             host::release(record_id, &lease_token);
-            Err(retry("Fakturownia is unreachable", RETRY_AFTER_MS))
+            Err(host::unreachable())
         }
         Http::Uncertain => {
             host::commit(
                 record_id,
                 json!({"lease_token": lease_token, "status": UNCERTAIN}),
             )?;
-            Err(retry("the push may have been applied", RETRY_AFTER_MS))
+            Err(retry(
+                "Fakturownia did not confirm the push, which may have been applied; retrying.",
+                None,
+            ))
         }
     }
 }
@@ -194,29 +162,46 @@ fn find_by_external_id(config: &Config, record_id: &str) -> Result<Option<String
         &format!("/clients.json?external_id={record_id}"),
         None,
     )? {
-        Http::Response { status, body } if status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_OK => {
             let clients: Value = host::decode(&body, "client list")?;
             Ok(clients
                 .as_array()
                 .and_then(|clients| clients.first())
                 .and_then(|client| client_id(&client.to_string())))
         }
-        Http::Response { status, body } => Err(failed_response(status, &body, Some(record_id))),
-        _ => Err(retry("could not look the client up", RETRY_AFTER_MS)),
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => Err(failed_response(
+            status,
+            &body,
+            retry_after.as_deref(),
+            Some(record_id),
+        )),
+        Http::RateLimited(after_ms) => Err(budget_spent(after_ms)),
+        _ => Err(retry(
+            "Could not look the client up in Fakturownia; retrying later.",
+            None,
+        )),
     }
 }
 
 /// Fetches a client from Fakturownia; `None` when it no longer exists.
 pub fn fetch_client(config: &Config, id: i64) -> Result<Option<Map<String, Value>>, Failure> {
     match host::fakturownia(config, "GET", &format!("/clients/{id}.json"), None)? {
-        Http::Response { status, body } if status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_OK => {
             let client: Value = host::decode(&body, "client")?;
             Ok(client.as_object().cloned())
         }
         Http::Response { status, .. } if status == STATUS_NOT_FOUND => Ok(None),
-        Http::Response { status, body } => Err(failed_response(status, &body, None)),
-        Http::RateLimited(after_ms) => Err(retry("request budget spent", after_ms)),
-        _ => Err(retry("Fakturownia did not answer", RETRY_AFTER_MS)),
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => Err(failed_response(status, &body, retry_after.as_deref(), None)),
+        Http::RateLimited(after_ms) => Err(budget_spent(after_ms)),
+        _ => Err(retry("Fakturownia did not answer; retrying later.", None)),
     }
 }
 
@@ -253,8 +238,13 @@ pub fn apply_client(
     client: &Map<String, Value>,
     mode: &Mode,
 ) -> Result<Applied, Failure> {
-    let id = client_id(&Value::Object(client.clone()).to_string())
-        .ok_or_else(|| rejected("invalid_client", "client without id".into(), None))?;
+    let id = client_id(&Value::Object(client.clone()).to_string()).ok_or_else(|| {
+        rejected(
+            "invalid_client",
+            "Fakturownia sent a client without an ID.".into(),
+            None,
+        )
+    })?;
     let updated_at = client
         .get("updated_at")
         .and_then(Value::as_str)

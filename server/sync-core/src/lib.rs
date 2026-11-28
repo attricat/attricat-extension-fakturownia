@@ -12,6 +12,7 @@
 //!   projection. If nothing changes, the change was the echo of our own push or
 //!   touched only unmapped fields, so nothing is written.
 
+pub mod errors;
 pub mod invoices;
 
 use std::collections::BTreeMap;
@@ -342,33 +343,6 @@ fn query_action(query: &str) -> Option<String> {
     valid.then(|| action.to_owned())
 }
 
-/// Fakturownia's validation error body: `{"code":"error","message":{"field":["- text"]}}`.
-pub fn validation_message(body: &str) -> String {
-    let Ok(body) = serde_json::from_str::<Value>(body) else {
-        return "Fakturownia rejected the request".into();
-    };
-    match body.get("message") {
-        Some(Value::Object(fields)) => fields
-            .iter()
-            .map(|(field, messages)| {
-                let messages = match messages {
-                    Value::Array(items) => items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(|text| text.trim_start_matches("- "))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    other => other.to_string(),
-                };
-                format!("{field}: {messages}")
-            })
-            .collect::<Vec<_>>()
-            .join("; "),
-        Some(Value::String(text)) => text.clone(),
-        _ => "Fakturownia rejected the request".into(),
-    }
-}
-
 /// Milliseconds since the Unix epoch of an RFC 3339 timestamp such as
 /// Fakturownia's `2026-11-25T10:00:00.000+01:00`, so timestamps with different
 /// offsets compare correctly.
@@ -623,14 +597,6 @@ mod tests {
                 "evil.com/x"
             ))
             .is_err()
-        );
-    }
-
-    #[test]
-    fn validation_errors_read_as_text() {
-        assert_eq!(
-            validation_message(r#"{"code":"error","message":{"name":["- nie może być puste"]}}"#),
-            "name: nie może być puste"
         );
     }
 }

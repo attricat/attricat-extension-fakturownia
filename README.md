@@ -42,7 +42,18 @@ Inbound changes, from a webhook or from `pull`, read the record, write only the 
 
 **API token.** It lives in an extension secret and is sent only as a host-substituted `Authorization: Bearer` header. It never enters component memory, a URL or a log.
 
-Validation errors (HTTP 422) become the record's export status `rejected`, with Fakturownia's field messages.
+**Fakturownia errors.** Since 0.6.0 every unusable Fakturownia answer becomes a typed failure with a message a person can read, which Attricat shows on the run page, in the run's failure toast, on the extension's **Failures** tab and in a record's export status. The message carries Fakturownia's own error text, read from `{"code":"error","message":{"field":["- text"]}}`, `{"message":"text"}`, a bare field map, a JSON string or plain text, as `Fakturownia: <text>` (at most 500 bytes), or names the HTTP status when the body has none (`errors.rs` in sync-core):
+
+| Answer | Failure | Code |
+| --- | --- | --- |
+| 401, 403 | `rejected`: *Fakturownia refused the API token (HTTP 401). Check the Fakturownia API token secret…* | `fakturownia_unauthorized` |
+| 422 | `rejected` with Fakturownia's field messages | `fakturownia_invalid` |
+| other 4xx | `rejected` with Fakturownia's text | `fakturownia_rejected` (`fakturownia_client_missing` for a push to a deleted client) |
+| 429, 5xx | `retry` after `Retry-After` seconds (capped at an hour), else 5 s | |
+| unreachable, the manifest's request budget spent, an unconfirmed write | `retry` | |
+| 1xx, 3xx | `rejected` | `fakturownia_unexpected` |
+
+Attricat Core keeps and shows these messages since the release after v1.13.0; an older host still retries and rejects alike but shows less. None is a `fault`, so a Fakturownia error never quarantines the installation. A push's rejection names the record, whose export status becomes `rejected`. A `pull` that is refused fails the run with the reason. In `issue-invoices` a refused invoice is that record's result (`failed`, with the message) and its export status, but a refused token ends the run with the reason, since every other record would fail alike. The token never appears in a code or message: the component never holds it.
 
 ### Invoices
 
@@ -217,7 +228,9 @@ It side-loads the archive, configures a fresh blueprint, registers the webhook e
 - a client created in Fakturownia becoming a record
 - clearing a field (the value is removed, not set to `""`)
 - a lost webhook caught up by `pull`, which merges: it clears an emptied field, keeps Attricat-owned ones, stores the merged hash and pushes nothing back
-- a 422 rejection
+- a 422 rejection carrying Fakturownia's field message
+- a 503 on a push retried after `Retry-After`
+- a 401 that fails `pull` with `fakturownia_unauthorized` and a message listed on the Failures tab, and a 429 retried after `Retry-After` without quarantine
 - a forged delivery accepted as a hint only, its body data never written, and an unreadable body acknowledged
 - that the token travelled only as a Bearer header
 - a `pull` refused when the configured blueprint code does not exist
@@ -227,7 +240,8 @@ and, with a fresh order, line, product and unit blueprint set and a single-line 
 - an invoice issued from an order with two lines (`client_id`, `oid`, positions with units and the default tax, no product IDs, `exclude_from_stock_level`), with number, status, view URL and the PDF written back
 - a second action on the same order refused
 - a create whose answer is lost retried without a second invoice
-- a line without a price rejected before anything is sent, and a Fakturownia 422 rejection
+- a line without a price rejected before anything is sent, and a Fakturownia 422 rejection with its field message
+- a 401 that ends the issuing run with `fakturownia_unauthorized`
 - the paid status and KSeF number arriving by webhook, and a lost invoice webhook caught up by `pull`
 - a deleted invoice clearing the order, which is then invoiced again
 - an invoice made in the mock linked to its order with `link_existing_by_oid`
@@ -266,6 +280,7 @@ every position's missing gross total. The view link, the PDF and the
 - Whether clients store and filter by **`external_id`**, which is used to find a create whose answer was lost.
 - The status of a create (assumed 201), the `updated_at` format, and the rate limits (the host permission allows 60 requests a minute).
 - **Invoice webhooks**: whether payments and KSeF numbers fire `invoice:update` (the KSeF documentation says a KSeF number does).
+- **Error bodies**: that answers other than a 422 (a refused token, a 404, a 5xx) carry `{"code":"error","message":"<text>"}`, and that a throttled request is answered 429 with `Retry-After` in seconds. The mock answers so; an unexpected shape only loses the text, and the message names the HTTP status instead.
 - **Invoice lookup**: that `GET /invoices.json` filters by `oid` and `client_id` together, used to find a create whose answer was lost.
 - The 422 Fakturownia answers to a duplicate `oid` with `oid_unique: "yes"` (a real account numbered its first invoice `1/11/2026`: the format follows the account's numbering settings, and the mock uses `FV <n>/<MM>/<YYYY>`), and that an omitted issue or sell date means today.
 - **Warehouse**: that an invoice whose positions have no `product_id`, sent with `exclude_from_stock_level`, creates no warehouse document on a warehouse-enabled account.

@@ -7,8 +7,10 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 
 use attricat_fakturownia_sync_core::Config;
+use attricat_fakturownia_sync_core::errors::{self, Failed};
 
 use crate::attricat::host::api;
+use crate::attricat::host::outcomes::{Failure, Rejection, Retry};
 use crate::attricat::host::{attricat_data, selection, transfer};
 
 /// The `source-name` of events caused by this extension's own writes.
@@ -416,11 +418,16 @@ pub fn storage_set(key: &str, value: &Value) -> Result<(), String> {
 
 // ---------------------------------------------------------------- Fakturownia
 
+/// The response header that tells how long to wait, in seconds.
+const RETRY_AFTER: &str = "retry-after";
+
 /// The outcome of one brokered Fakturownia request.
 pub enum Http {
     Response {
         status: u16,
         body: String,
+        /// The `Retry-After` header, which the host always returns.
+        retry_after: Option<String>,
     },
     /// The rule's budget is spent; try again after the wait.
     RateLimited(u64),
@@ -460,6 +467,7 @@ pub fn fakturownia(
             Http::Response {
                 status: response["status"].as_u64().unwrap_or_default() as u16,
                 body: String::from_utf8_lossy(&bytes).into_owned(),
+                retry_after: response["headers"][RETRY_AFTER].as_str().map(str::to_owned),
             }
         }
         Some("rate_limited") => {
@@ -468,4 +476,55 @@ pub fn fakturownia(
         Some("unreachable") => Http::Unreachable,
         _ => Http::Uncertain,
     })
+}
+
+/// The typed failure of an unusable Fakturownia answer: a rejection with
+/// Fakturownia's error text (about `record_id` when given), or a retry that
+/// honours `Retry-After`. Never a fault, so a Fakturownia error never
+/// quarantines the installation.
+pub fn failed_response(
+    status: u16,
+    body: &str,
+    retry_after: Option<&str>,
+    record_id: Option<&str>,
+) -> Failure {
+    match errors::failed_response(status, body, retry_after) {
+        Failed::Rejected { code, message } => rejected(code, message, record_id),
+        Failed::Retry { message, after_ms } => Failure::Retry(Retry {
+            message,
+            after_ms: Some(after_ms),
+        }),
+    }
+}
+
+/// A rejection a person can read, about `record_id` when given.
+pub fn rejected(code: &str, message: String, record_id: Option<&str>) -> Failure {
+    Failure::Rejected(Rejection {
+        code: code.into(),
+        message: errors::bounded(message),
+        record_id: record_id.map(str::to_owned),
+        connection: None,
+    })
+}
+
+/// A retry after `after_ms`, or the default wait.
+pub fn retry(message: &str, after_ms: Option<u64>) -> Failure {
+    Failure::Retry(Retry {
+        message: message.into(),
+        after_ms: Some(after_ms.unwrap_or(errors::DEFAULT_RETRY_AFTER_MS)),
+    })
+}
+
+/// The retry of a request the host did not send because the manifest's
+/// request budget for Fakturownia is spent.
+pub fn budget_spent(after_ms: u64) -> Failure {
+    retry(
+        "The request budget for Fakturownia is spent; retrying later.",
+        Some(after_ms),
+    )
+}
+
+/// The retry of a request that never reached Fakturownia.
+pub fn unreachable() -> Failure {
+    retry("Fakturownia is unreachable; retrying later.", None)
 }

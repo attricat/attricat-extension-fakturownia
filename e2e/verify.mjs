@@ -153,7 +153,7 @@ for (const capability of manifest.permissions) {
 for (const rule of manifest.host_permissions) {
   await api('POST', `/extensions/${extensionId}/grants`, { grant_kind: 'host_permission', grant_id: rule.id });
 }
-await api('PUT', '/workspace/extension-secrets/fakturownia-api-token', { value: mockToken });
+await api('PUT', `/extensions/${extensionId}/secrets/fakturownia-api-token`, { value: mockToken });
 // Configuration names the blueprint and the context by code; the extension
 // looks their IDs and the current blueprint revision up itself.
 const configuration = (blueprintCodeInConfig) => ({
@@ -299,6 +299,34 @@ const rejected = await waitFor('the rejection', async () => {
   return current?.status === 'rejected' ? current : undefined;
 });
 console.log(`  rejected: ${JSON.stringify(rejected.error ?? rejected.last_error)}`);
+assert.match(JSON.stringify(rejected), /fakturownia_invalid/, JSON.stringify(rejected));
+assert.match(JSON.stringify(rejected), /Fakturownia: name: nie może być puste/, JSON.stringify(rejected));
+
+step('a server error on a push is retried after Retry-After until it goes through');
+await mock('POST', '/fail', { method: 'PUT', path: `/clients/${remote.id}.json`, status: 503, count: 1,
+  headers: { 'retry-after': '1' }, body: { code: 'error', message: 'Service Unavailable' } });
+await update(acme, [scalar('city', 'Sopot')]);
+await waitFor('the retried push', async () => (await clients()).find((client) => client.id === remote.id)?.city === 'Sopot');
+assert.equal((await mapping(acme)).status, 'synced');
+
+step('a refused API token fails the pull with a readable reason, without quarantine');
+await mock('POST', '/fail', { method: 'GET', path: '/clients.json', status: 401, count: 1,
+  body: { code: 'error', message: 'You must be logged in to gain access to the site' } });
+const refused = await pull('refused-token');
+assert.equal(refused.status, 'dead_letter', JSON.stringify(refused));
+assert.match(JSON.stringify(refused), /fakturownia_unauthorized/, JSON.stringify(refused));
+assert.match(JSON.stringify(refused), /API token secret/, JSON.stringify(refused));
+assert(!JSON.stringify(refused).includes(mockToken), 'the failure never carries the token');
+const failedRuns = (await api('GET', `/extensions/${extensionId}/failures/runs`)).items ?? [];
+const listed = failedRuns.find((run) => run.id === (refused.id ?? refused.run_id));
+assert(listed, `the Failures tab lists the run: ${JSON.stringify(failedRuns)}`);
+assert.equal(listed.error_code, 'fakturownia_unauthorized', JSON.stringify(listed));
+assert.match(listed.error_message ?? '', /^Fakturownia refused the API token \(HTTP 401\)/, JSON.stringify(listed));
+
+step('a throttled pull waits for Retry-After and completes');
+await mock('POST', '/fail', { method: 'GET', path: '/clients.json', status: 429, count: 1, headers: { 'retry-after': '1' } });
+const throttled = await pull('throttled');
+assert.equal(throttled.status, 'completed', `the extension was not quarantined: ${JSON.stringify(throttled)}`);
 
 // ---- invoices -------------------------------------------------------------------
 
@@ -488,8 +516,21 @@ await mock('POST', '/fail', { method: 'POST', path: '/invoices.json', status: 42
   body: { code: 'error', message: { buyer_tax_no: ['- jest nieprawidłowy'] } } });
 const invalid = await issueInvoices(orderBlueprint, [order4], 'issue-4');
 assert.equal(results(invalid)[0]?.outcome, 'failed');
-assert.equal(results(invalid)[0].message, 'buyer_tax_no: jest nieprawidłowy');
+assert.equal(results(invalid)[0].message, 'Fakturownia: buyer_tax_no: jest nieprawidłowy');
+assert.match(JSON.stringify((await mapping(order4)).error), /Fakturownia: buyer_tax_no: jest nieprawidłowy/);
 assert.equal((await mapping(order4)).status, 'rejected');
+
+step('a refused API token ends the issuing run with the reason instead of failing each record');
+const order7 = await order(`ZS/7/${suffix}`, [{ item: gadget, quantity: 1, price: 1 }]);
+await mock('POST', '/fail', { method: 'POST', path: '/invoices.json', status: 401, count: 1,
+  body: { code: 'error', message: 'You must be logged in to gain access to the site' } });
+const unauthorized = await issueInvoices(orderBlueprint, [order7], 'issue-7');
+assert.equal(unauthorized.status, 'dead_letter', JSON.stringify(unauthorized));
+assert.match(JSON.stringify(unauthorized), /fakturownia_unauthorized/, JSON.stringify(unauthorized));
+assert.match(JSON.stringify(unauthorized), /API token secret/, JSON.stringify(unauthorized));
+const order7Mapping = await mapping(order7);
+assert.equal(order7Mapping.status, 'rejected', JSON.stringify(order7Mapping));
+assert.match(JSON.stringify(order7Mapping.error), /fakturownia_unauthorized/);
 
 step('payment and the KSeF number arrive through the webhook');
 await mock('PATCH', `/ui/${account}/invoices/${invoice1.id}`, { status: 'paid', gov_id: '5250001009-20261126-0A1B2C3D4E5F-01', gov_status: 'ok' });
@@ -532,7 +573,8 @@ const order5 = await order(number5, [{ item: widget, quantity: 1, price: 1 }]);
 const { id: manualId } = await mock('POST', `/ui/${account}/invoices`, { oid: number5, client_id: remote.id,
   positions: [{ name: 'Typed by hand', quantity: 1, price_net: 1, tax: '23', total_price_gross: '1.23' }] });
 await waitFor('the linked order', async () => (await mapping(order5))?.external_id === `invoice:${manualId}`);
-assert.equal((await values(order5)).invoice_status, 'issued');
+// The mapping is committed before the write-back, so wait for the values too.
+await waitFor('the linked order\'s status', async () => (await values(order5)).invoice_status === 'issued');
 
 step('a single-line goods issue is invoiced from the record itself');
 await configureInvoices({

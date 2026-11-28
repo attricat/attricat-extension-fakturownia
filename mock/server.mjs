@@ -33,6 +33,9 @@
 // `oid` and `client_id` filter together, the 422 message of a duplicate
 // `oid`, that an omitted issue or sell date means today, and the number
 // format `FV <n>/<MM>/<YYYY>`. The mock never creates warehouse documents.
+// ASSUMED as well: that errors other than a 422 (401, 404, injected 5xx)
+// carry `{code: 'error', message: '<text>'}`, and that a 429 sends
+// `Retry-After` in seconds (inject one with `/fail` `headers`).
 //
 // Inspection API on http://127.0.0.1:9580 (no auth):
 //   GET  /state                       accounts, clients, webhooks, deliveries
@@ -45,10 +48,11 @@
 //   POST /ui/:account/invoices        create an invoice as a user
 //   PATCH /ui/:account/invoices/:id   edit an invoice (status, gov_id, ...)
 //   DELETE /ui/:account/invoices/:id  delete an invoice as a user
-//   POST /fail {method, path, status, count, body?, drop?}  fail the next
-//        matching requests; `body` replaces the error body (a 422's field
-//        messages), and `drop` applies the request but resets the connection
-//        instead of answering (a lost response)
+//   POST /fail {method, path, status, count, body?, headers?, drop?}  fail
+//        the next matching requests; `body` replaces the error body (a 422's
+//        field messages), `headers` adds response headers (`retry-after`),
+//        and `drop` applies the request but resets the connection instead of
+//        answering (a lost response)
 
 import { createServer as createHttpsServer } from 'node:https';
 import { createServer as createHttpServer } from 'node:http';
@@ -88,8 +92,8 @@ const timestamp = () => {
   return local;
 };
 
-const json = (response, status, body) => {
-  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+const json = (response, status, body, headers = {}) => {
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...headers });
   response.end(body === undefined ? '' : JSON.stringify(body));
 };
 
@@ -274,7 +278,7 @@ const api = async (request, response) => {
     return json(response, STATUS.unauthorized, { code: 'error', message: 'You must be logged in to gain access to the site' });
   }
   const failure = takeFailure(request.method, url.pathname);
-  if (failure && !failure.drop) return json(response, failure.status, failure.body ?? { code: 'error', message: 'injected failure' });
+  if (failure && !failure.drop) return json(response, failure.status, failure.body ?? { code: 'error', message: 'injected failure' }, failure.headers);
   const input = body ? JSON.parse(body) : {};
   const { clients, invoices, webhooks } = account(accountName);
   if (failure?.drop) {
@@ -396,7 +400,7 @@ const inspect = async (request, response) => {
     return json(response, STATUS.ok, { paused: state.paused });
   }
   if (url.pathname === '/fail' && request.method === 'POST') {
-    state.failures.push({ method: input.method, path: input.path, status: input.status, count: input.count ?? 1, body: input.body, drop: Boolean(input.drop) });
+    state.failures.push({ method: input.method, path: input.path, status: input.status, count: input.count ?? 1, body: input.body, headers: input.headers ?? {}, drop: Boolean(input.drop) });
     return json(response, STATUS.ok, { failures: state.failures });
   }
   if ((match = url.pathname.match(/^\/ui\/([a-z0-9-]+)\/clients$/)) && request.method === 'POST') {

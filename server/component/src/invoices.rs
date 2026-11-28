@@ -17,28 +17,26 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use attricat_fakturownia_sync_core::errors::CODE_UNAUTHORIZED;
 use attricat_fakturownia_sync_core::invoices::{
     BlueprintShape, Catalog, HeaderValues, InvoiceSync, PositionValues, blueprint_shape,
     clear_writes, invoice_external_id, invoice_id, invoice_state, local_write_back, path_segments,
     pdf_filename, position, validate_against, write_back_hash, write_back_projection,
     write_back_writes,
 };
-use attricat_fakturownia_sync_core::{Config, InboundWrite, validation_message};
+use attricat_fakturownia_sync_core::{Config, InboundWrite};
 
 use crate::attricat::host::clock;
-use crate::attricat::host::outcomes::{Failure, Rejection, Retry};
+use crate::attricat::host::outcomes::{Failure, Rejection};
 use crate::exports::attricat::host::deferrable_operations::{BatchOutcome, OperationRequest};
-use crate::host::{self, Http, Mode, Record, decode, encode};
+use crate::host::{self, Http, Mode, Record, budget_spent, decode, encode, failed_response};
 
 pub const OPERATION: &str = "issue-invoices";
 
 const STATUS_OK: u16 = 200;
 const STATUS_CREATED: u16 = 201;
-const STATUS_UNAUTHORIZED: u16 = 401;
-const STATUS_FORBIDDEN: u16 = 403;
 const STATUS_NOT_FOUND: u16 = 404;
 const STATUS_UNPROCESSABLE: u16 = 422;
-const RETRY_AFTER_MS: u64 = 5_000;
 /// How long another run's pending create is left alone before this run
 /// looks for its invoice and, finding none, creates one.
 const PENDING_GRACE_MS: i64 = 120_000;
@@ -50,10 +48,7 @@ const REJECTED: &str = "rejected";
 const MAX_INTENT_KEY_BYTES: usize = 128;
 
 fn retry(message: &str) -> Failure {
-    Failure::Retry(Retry {
-        message: message.into(),
-        after_ms: Some(RETRY_AFTER_MS),
-    })
+    host::retry(message, None)
 }
 
 fn configuration_invalid(message: String) -> Failure {
@@ -438,8 +433,9 @@ fn issue(
     if let Some(invoice) = mapping["external_id"].as_str().and_then(invoice_id) {
         // A retried batch of the run that issued it finishes the write-back.
         if mapping["external_ids"]["run"] == run_id {
-            let invoice = fetch_invoice(config, invoice)?
-                .ok_or_else(|| retry("the invoice just issued is not found"))?;
+            let invoice = fetch_invoice(config, invoice)?.ok_or_else(|| {
+                retry("The invoice just issued is not found in Fakturownia yet; retrying.")
+            })?;
             return finish(config, sync, mode, &context_id, record_id, run_id, &invoice);
         }
         let number = mapping["external_ids"]["number"]
@@ -468,7 +464,9 @@ fn issue(
         .flatten();
     if let Some(pending) = &pending {
         if pending.run != run_id && now_ms() - pending.at_ms < PENDING_GRACE_MS {
-            return Err(retry("another run is issuing this record's invoice"));
+            return Err(retry(
+                "Another run is issuing this record's invoice; retrying later.",
+            ));
         }
         // ASSUMED: the list filters by `oid` and `client_id` together.
         if let Some(invoice) = find_invoice(config, &pending.oid, &pending.client_id)? {
@@ -489,46 +487,49 @@ fn issue(
         json!({"status": UNCERTAIN, "external_ids": {"pending": marker}}),
     )?;
     match host::fakturownia(config, "POST", "/invoices.json", Some(&draft.body))? {
-        Http::Response { status, body } if status == STATUS_CREATED || status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_CREATED || status == STATUS_OK => {
             let invoice: Value = decode(&body, "invoice")?;
             let invoice = invoice
                 .as_object()
                 .cloned()
-                .ok_or_else(|| retry("Fakturownia answered without an invoice"))?;
+                .ok_or_else(|| retry("Fakturownia answered without an invoice; retrying."))?;
             finish(config, sync, mode, &context_id, record_id, run_id, &invoice)
         }
-        Http::Response { status, body } if status == STATUS_UNPROCESSABLE => {
-            // `oid_unique` refuses a second invoice for the order: find the
-            // one that exists, which a lost answer may have created.
-            if let Some(invoice) = find_invoice(config, &draft.oid, &draft.client_id)? {
-                return finish(config, sync, mode, &context_id, record_id, run_id, &invoice);
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => {
+            if status == STATUS_UNPROCESSABLE {
+                // `oid_unique` refuses a second invoice for the order: find
+                // the one that exists, which a lost answer may have created.
+                if let Some(invoice) = find_invoice(config, &draft.oid, &draft.client_id)? {
+                    return finish(config, sync, mode, &context_id, record_id, run_id, &invoice);
+                }
             }
-            reject(record_id, "fakturownia_invalid", validation_message(&body))
+            match failed_response(status, &body, retry_after.as_deref(), Some(record_id)) {
+                // A refused token fails every record alike: settle this one
+                // and end the run with the reason, instead of failing each.
+                Failure::Rejected(rejection) if rejection.code == CODE_UNAUTHORIZED => {
+                    reject(record_id, &rejection.code, rejection.message.clone())?;
+                    Err(Failure::Rejected(Rejection {
+                        record_id: None,
+                        ..rejection
+                    }))
+                }
+                // Any other refusal is this record's result.
+                Failure::Rejected(rejection) => {
+                    reject(record_id, &rejection.code, rejection.message)
+                }
+                failure => Err(failure),
+            }
         }
-        Http::Response { status, .. }
-            if status == STATUS_UNAUTHORIZED || status == STATUS_FORBIDDEN =>
-        {
-            reject(
-                record_id,
-                "fakturownia_unauthorized",
-                "Fakturownia refused the API token".into(),
-            )
-        }
-        Http::Response { status, .. } if status >= 500 => {
-            Err(retry("Fakturownia failed to answer"))
-        }
-        Http::Response { status, .. } => reject(
-            record_id,
-            "fakturownia_unexpected",
-            format!("Fakturownia answered HTTP {status}"),
-        ),
-        Http::RateLimited(after_ms) => Err(Failure::Retry(Retry {
-            message: "request budget spent".into(),
-            after_ms: Some(after_ms),
-        })),
-        Http::Unreachable => Err(retry("Fakturownia is unreachable")),
+        Http::RateLimited(after_ms) => Err(budget_spent(after_ms)),
+        Http::Unreachable => Err(host::unreachable()),
         // The invoice may exist: the retried batch looks it up first.
-        Http::Uncertain => Err(retry("the invoice may have been issued")),
+        Http::Uncertain => Err(retry(
+            "Fakturownia did not confirm the invoice, which may have been issued; retrying.",
+        )),
     }
 }
 
@@ -661,33 +662,21 @@ fn apply_writes(
 
 // ------------------------------------------------------------ Fakturownia
 
-fn failed_read(status: u16) -> Failure {
-    if status == STATUS_UNAUTHORIZED || status == STATUS_FORBIDDEN {
-        Failure::Rejected(Rejection {
-            code: "fakturownia_unauthorized".into(),
-            message: "Fakturownia refused the API token".into(),
-            record_id: None,
-            connection: None,
-        })
-    } else {
-        retry(&format!("Fakturownia answered HTTP {status}"))
-    }
-}
-
 /// Fetches an invoice; `None` when it no longer exists.
 pub fn fetch_invoice(config: &Config, id: &str) -> Result<Option<Map<String, Value>>, Failure> {
     match host::fakturownia(config, "GET", &format!("/invoices/{id}.json"), None)? {
-        Http::Response { status, body } if status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_OK => {
             let invoice: Value = decode(&body, "invoice")?;
             Ok(invoice.as_object().cloned())
         }
         Http::Response { status, .. } if status == STATUS_NOT_FOUND => Ok(None),
-        Http::Response { status, .. } => Err(failed_read(status)),
-        Http::RateLimited(after_ms) => Err(Failure::Retry(Retry {
-            message: "request budget spent".into(),
-            after_ms: Some(after_ms),
-        })),
-        _ => Err(retry("Fakturownia did not answer")),
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => Err(failed_response(status, &body, retry_after.as_deref(), None)),
+        Http::RateLimited(after_ms) => Err(budget_spent(after_ms)),
+        _ => Err(retry("Fakturownia did not answer; retrying later.")),
     }
 }
 
@@ -703,7 +692,7 @@ fn find_invoice(
         query_escape(client_id)
     );
     match host::fakturownia(config, "GET", &path, None)? {
-        Http::Response { status, body } if status == STATUS_OK => {
+        Http::Response { status, body, .. } if status == STATUS_OK => {
             let invoices: Value = decode(&body, "invoice list")?;
             Ok(invoices
                 .as_array()
@@ -716,8 +705,15 @@ fn find_invoice(
                 })
                 .cloned())
         }
-        Http::Response { status, .. } => Err(failed_read(status)),
-        _ => Err(retry("could not look the invoice up")),
+        Http::Response {
+            status,
+            body,
+            retry_after,
+        } => Err(failed_response(status, &body, retry_after.as_deref(), None)),
+        Http::RateLimited(after_ms) => Err(budget_spent(after_ms)),
+        _ => Err(retry(
+            "Could not look the invoice up in Fakturownia; retrying later.",
+        )),
     }
 }
 
